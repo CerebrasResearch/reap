@@ -58,11 +58,9 @@ short_model_name=$(echo $model_name | cut -d'/' -f2)
 short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
 merged_model="artifacts/${short_model_name}/${short_dataset_name}/non_uniform_merged_models/${merged_model_dir_name}/${cluster_description}"
 
-bash experiments/eval.sh ${merged_model} ${seed} ${port} ${server_log_file_name} ${run_lm_eval} ${run_evalplus} ${run_livecodebench} ${run_math} false
-if [[ $run_wildbench == true ]]; then
-    bash experiments/eval-wildbench.sh ${merged_model} ${seed} ${port} ${server_log_file_name} false false false false true
-fi
-echo "Removing safetensor files from ${merged_model}"
+bash experiments/eval.sh ${merged_model} ${seed} ${port} ${server_log_file_name} ${run_lm_eval} ${run_evalplus} ${run_livecodebench} ${run_math} ${run_wildbench}
+
+# echo "Removing safetensor files from ${merged_model}"
 # rm ${merged_model}/*.safetensors
 
 echo "Finished M-SMoE for model: ${model_name}, dataset: ${dataset_name}, compression ratio: ${compression_ratio}"

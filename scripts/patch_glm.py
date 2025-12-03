@@ -15,7 +15,7 @@ def main():
     )
 
     # Download the full model into artifacts/models/<model_name>
-    model_name = "GLM-4.5-Air-FP8"
+    model_name = "GLM-4.5-Air"
     artifacts_dir = os.path.normpath(
         os.path.join(script_dir, os.pardir, "artifacts", "models")
     )
