@@ -353,23 +353,13 @@ class MoETransformerObserver(BaseTransformerObserver):
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
             if self.hook_config.fused_experts:
-                _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
+                router_output = module.router(flat_input)
+                router_logits = router_output[-1] if isinstance(router_output, tuple) else router_output
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 selected_experts = selected_experts.to(device)
-                router_indices = (
-                    torch.arange(batch_size * sequence_length, device=device)
-                    .view(1, -1)
-                    .expand(router_scores.size(0), -1)
-                )
-                router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-                routed_in = torch.gather(
-                    input=flat_input,
-                    dim=0,
-                    index=router_indices,
-                ).to(device)
-                # we do not apply router_scores
-                # record unweighted activations for all experts
+                # Compute unweighted per-expert activations by feeding
+                # flat_input through each expert independently.
+                routed_in = flat_input.repeat(num_experts, 1)
                 routed_out = module.experts(routed_in)
                 activations = routed_out.view(num_experts, *flat_input.shape)
 
