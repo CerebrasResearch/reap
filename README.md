@@ -1,5 +1,9 @@
 # Router-weighted Expert Activation Pruning (REAP)
 
+## Updates
+* 2026-03-11: For REAP saliency, top-k router logits are now correctly renormalized to sum to 1. See `args.py:ObserverArgs.renormalize_router_weights`. Generally, you can expect a modest improvement for most model/datasets with this fix in place. On non-agentic coding evaluations across ERNIE-4.5-21B-A3B-PT, Qwen3-30B-A3B, Mixtral-8x7B-Instruct-v0.1, GLM-4.5-Air,and Llama-4-Scout-17B-16E-Instruct, REAP achieves a mean decrease in accuracy of 1.9% vs. 2.6% without logit normalization. Our prior large-scale results and all Cerebras checkpoints on previously calibrated with normalized logits. 
+* 2026-03-01: REAP has been accepted to ICLR 2026, see you in Rio! 
+
 ## Summary
 <img src="./fig/reaper.png" align="right" alt="REAP the experts" width="400">
 This repository contains code required to reproduce the expert pruning and merging methods used in the paper: <a href="https://arxiv.org/abs/2510.13999">REAP the Experts: Why Pruning Prevails for One-Shot MoE compression</a>
@@ -23,7 +27,7 @@ Expert pruning and merging can be used to reduce the memory overhead of Sparsely
 ![large-scale pruned SMoE results](./fig/large-scale-moe.png)
 
 
-## <img src="./fig/hf-transparent.png" alt="Qwen3-Coder-REAP-246B-A35B-FP8" width='20'>  HuggingFace checkpoints
+## <img src="./fig/hf-transparent.png" alt="Cerebras REAP checkpoints" width='20'>  HuggingFace checkpoints
 [REAP model collection on HuggingFace](https://huggingface.co/collections/cerebras/cerebras-reap), including pruned versions of GLM4.6, GLM4.5-Air, Qwen3-Coder-480B, Qwen3-Coder-30B, MiniMax-M2, Kimi-Linear, DeepSeek-V3.2. More to come, stay tuned!
 
 ## Installation
@@ -127,13 +131,13 @@ The `src/reap` directory contains the main codebase:
 ## Citation
 Please consider using the following citation if you found this work useful:
 ```
-@misc{lasby-reap,
-    title       = {{REAP the Experts: Why Pruning Prevails for One-Shot MoE compression}},
-    author      = {Lasby, Mike and Lazarevich, Ivan and Sinnadurai, Nish and Lie, Sean and Ioannou, Yani and Thangarasa, Vithursan},
-    year        = {2025},
-    publisher   = {arXiv},
-    note        = {arXiv:2510.13999v1 [cs]},
-    url         = {https://arxiv.org/abs/2510.13999v1}, 
+@inproceedings{
+    lasby2026reap,
+    title={{REAP} the Experts: Why Pruning Prevails for One-Shot MoE compression},
+    author={Mike Lasby and Ivan Lazarevich and Nish Sinnadurai and Sean Lie and Yani Ioannou and Vithursan Thangarasa},
+    booktitle={The Fourteenth International Conference on Learning Representations},
+    year={2026},
+    url={https://openreview.net/forum?id=ukGxWd2aDG}
 }
 ```
 

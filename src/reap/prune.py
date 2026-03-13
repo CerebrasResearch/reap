@@ -212,7 +212,6 @@ def get_pruned_model_dir(
     total_experts: int,
     prune_args,
     seed: int,
-    renorm: bool,
 ) -> pathlib.Path:
     compression_ratio_str = f"{(n_experts_to_prune / total_experts):.2f}"
     pruned_model_name = f"{prune_args.prune_method}"
@@ -220,8 +219,6 @@ def get_pruned_model_dir(
         pruned_model_name += "-perserve_super"
     elif prune_args.perserve_outliers:
         pruned_model_name += "-perserve_outlier"
-    if renorm:
-        pruned_model_name += f"-renorm_{str(renorm).lower()}"
     pruned_model_name += f"-seed_{seed}"
     pruned_model_name += f"-{compression_ratio_str}"
     pruned_model_dir = results_dir / "pruned_models" / pruned_model_name
@@ -299,7 +296,7 @@ def main():
             )
 
     pruned_model_dir = get_pruned_model_dir(
-        results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed, obs_args.renormalize_router_weights
+        results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed
     )
     if (
         pruned_model_dir.exists()

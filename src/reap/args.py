@@ -139,7 +139,7 @@ class ObserverArgs:
         },
     )
     renormalize_router_weights: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
                 "Whether to renormalize topk router weights to sum to 1 if the model.config.norm_topk_prob is True."
