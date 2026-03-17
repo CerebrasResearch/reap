@@ -16,9 +16,12 @@ token or a prompt-completion dataset for training on completions only with SFTTr
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import uuid
+import json
+import re
 import random
 import logging
-from functools import partial
 
 
 import torch
@@ -30,6 +33,102 @@ from vllm import TokensPrompt
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class CompositeDatasetComponent:
+    """A single component of a composite dataset specification.
+
+    Attributes:
+        name: HuggingFace dataset name (e.g., "open-r1/Mixture-of-Thoughts").
+        split: HF dataset split to load (e.g., "code", "train"). None means use
+               the default split from DatasetArgs.
+        num_samples: Number of samples to draw from this component.
+    """
+
+    name: str
+    split: str | None
+    num_samples: int
+
+
+# Regex to parse a single component: <name>[<split>]:<num_samples>
+# Examples:
+#   "theblackcat102/evol-codealpaca-v1:4096"         -> name="theblackcat102/evol-codealpaca-v1", split=None, num_samples=4096
+#   "open-r1/Mixture-of-Thoughts[code]:4096"          -> name="open-r1/Mixture-of-Thoughts", split="code", num_samples=4096
+#   "SWE-bench/SWE-smith-trajectories:4096"           -> name="SWE-bench/SWE-smith-trajectories", split=None, num_samples=4096
+_COMPOSITE_COMPONENT_RE = re.compile(
+    r"^(?P<name>[^\[\]:,]+)"  # dataset name (no brackets, colons, commas)
+    r"(?:\[(?P<split>[^\]]+)\])?"  # optional [split]
+    r":(?P<num_samples>\d+)$"  # :num_samples (required for composite)
+)
+
+
+def parse_composite_dataset_spec(
+    spec: str,
+    default_split: str = "train",
+) -> list[CompositeDatasetComponent] | None:
+    """Parse a composite dataset specification string.
+
+    Returns a list of CompositeDatasetComponent if the spec is composite
+    (contains comma-separated entries with :num_samples), or None if the spec
+    is a single dataset name (backward-compatible).
+
+    Format: ``name1[split1]:N1,name2:N2,name3[split3]:N3,...``
+
+    Args:
+        spec: The dataset specification string.
+        default_split: The default split to use when no [split] is specified.
+
+    Returns:
+        List of parsed components, or None if this is a plain single-dataset name.
+
+    Raises:
+        ValueError: If the spec looks like a composite spec but has parse errors.
+    """
+    # A composite spec must contain at least one colon followed by digits.
+    # Single dataset names like "theblackcat102/evol-codealpaca-v1" won't match.
+    if ":" not in spec:
+        return None
+
+    # Could be a single dataset with a colon in the name (unlikely for HF) —
+    # but to be safe, also require at least one comma OR the entire string to
+    # match the component pattern.
+    parts = [p.strip() for p in spec.split(",")]
+
+    components = []
+    for i, part in enumerate(parts):
+        m = _COMPOSITE_COMPONENT_RE.match(part)
+        if m is None:
+            if len(parts) == 1:
+                # Single entry that doesn't match composite format — treat as
+                # a plain dataset name (backward compatible).
+                return None
+            raise ValueError(
+                f"Failed to parse composite dataset component {i}: '{part}'. "
+                f"Expected format: <dataset_name>[<split>]:<num_samples>. "
+                f"Full spec: '{spec}'"
+            )
+        name = m.group("name").strip()
+        split = m.group("split")
+        if split is None:
+            split = default_split
+        num_samples = int(m.group("num_samples"))
+        components.append(
+            CompositeDatasetComponent(
+                name=name,
+                split=split,
+                num_samples=num_samples,
+            )
+        )
+
+    if not components:
+        return None
+
+    logger.info(
+        f"Parsed composite dataset spec with {len(components)} components: "
+        + ", ".join(f"{c.name}[{c.split}]:{c.num_samples}" for c in components)
+    )
+    return components
+
+
 # --- Base Dataset Processors --------------------------------------------------
 
 
@@ -39,6 +138,7 @@ class BaseDatasetProcessor(ABC):
     completion_field: str = "completion"
     prompt_field: str = "prompt"
     messages_field: str = "messages"
+    tools_field: str = "tools"
     all_categories_label: str = "all"
 
     def __init__(
@@ -123,8 +223,8 @@ class BaseDatasetProcessor(ABC):
         )
 
     @abstractmethod
-    def _encode_sample(self, sample: str) -> torch.Tensor:
-        """Encode a str sample from the desired category of the dataset into
+    def _encode_sample(self, sample: dict) -> torch.Tensor:
+        """Encode a sample from the desired category of the dataset into
         tokens.
         """
         raise NotImplementedError(
@@ -267,11 +367,15 @@ class BaseDatasetProcessor(ABC):
 
 
 class ChatDatasetProcessor(BaseDatasetProcessor):
-    def _encode_sample(self, sample: str) -> torch.Tensor:
+    def _encode_sample(self, sample: dict) -> torch.Tensor:
+        chat_template_kwargs = {}
+        if self.tools_field in sample:
+            chat_template_kwargs = {"tools": sample[self.tools_field]}
         chat_sample = self.tokenizer.apply_chat_template(
             sample[self.messages_field],
             add_generation_prompt=False,
             tokenize=False,
+            **chat_template_kwargs,
         )
         return self.tokenizer(
             chat_sample,
@@ -335,14 +439,16 @@ class TuluSFTMixtureChatDataset(ChatDatasetProcessor):
     def _map_fn(sample: dict[str, any]) -> dict[str, any]:
         return sample
 
+
 class PersonasMathChatDataset(ChatDatasetProcessor):
     """Dataset for Tulu-3 SFT Personas Math."""
-    
+
     category_field: str = None
 
     @staticmethod
     def _map_fn(sample: dict[str, any]) -> dict[str, any]:
         return sample
+
 
 class WildChatSFTMixtureChatDataset(ChatDatasetProcessor):
     category_field: str = "langauge"
@@ -407,20 +513,215 @@ class CodeAlpacaChatDataset(ChatDatasetProcessor):
             ],
         }
 
+
 class WritingPromptsChatDataset(ChatDatasetProcessor):
     """Dataset for WritingPrompts_curated."""
-    
+
     category_field: str = None
 
     @staticmethod
     def _map_fn(sample: dict[str, any]) -> dict[str, any]:
         return {
             "messages": [
-                {"role": "user", "content": f"Please write a creative story using the following writing prompt:\n\n {sample['prompt']}"},
+                {
+                    "role": "user",
+                    "content": f"Please write a creative story using the following writing prompt:\n\n {sample['prompt']}",
+                },
                 {"role": "assistant", "content": sample["body"]},
             ],
         }
 
+
+class MixtureOfThoughtsDataset(ChatDatasetProcessor):
+    category_field: str = None
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        return sample
+
+
+class XLamFunctionCallingDataset(ChatDatasetProcessor):
+    category_field: str = None
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        tool_calls = []
+        for tool_call in sample["answers"]:
+            tool_calls.append(
+                {
+                    "function": {
+                        "arguments": json.dumps(tool_call["arguments"]),
+                        "name": tool_call["name"],
+                    },
+                    "id": f"chatcmpl-tool-{uuid.uuid4()}",
+                    "type": "function",
+                }
+            )
+
+        return {
+            "messages": [
+                {"role": "user", "content": sample["query"]},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": tool_calls,
+                },
+            ],
+            "tools": sample["tools"],
+        }
+
+
+class SWESmithTrajectoriesDataset(ChatDatasetProcessor):
+    category_field: str = None
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "str_replace_editor",
+                "description": (
+                    "Custom editing tool for viewing, creating and editing files.\n"
+                    "State is persistent across calls. If `path` is a file, `view` shows `cat -n`; "
+                    "if a directory, `view` lists non-hidden entries up to 2 levels. "
+                    "The `create` command fails if `path` already exists as a file. "
+                    "Long outputs may be truncated with '<response clipped>'. "
+                    "`undo_edit` reverts the last edit for `path`.\n\n"
+                    "Notes for `str_replace`:\n"
+                    "- `old_str` must match EXACTLY one or more consecutive lines (watch whitespace).\n"
+                    "- If `old_str` is not unique in the file, no replacement happens—include enough context.\n"
+                    "- `new_str` contains the edited lines replacing `old_str`."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to run.",
+                            "enum": [
+                                "view",
+                                "create",
+                                "str_replace",
+                                "insert",
+                                "undo_edit",
+                            ],
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to file or directory, e.g. `/testbed/file.py` or `/testbed`.",
+                        },
+                        "file_text": {
+                            "type": "string",
+                            "description": "Required for `create`: the full contents of the new file.",
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "Required for `str_replace`: the exact string in `path` to replace.",
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": (
+                                "Optional for `str_replace` (replacement text). "
+                                "Required for `insert` (the string to insert)."
+                            ),
+                        },
+                        "insert_line": {
+                            "type": "integer",
+                            "description": "Required for `insert`: insert `new_str` AFTER this 1-based line number.",
+                        },
+                        "view_range": {
+                            "type": "array",
+                            "description": (
+                                "Optional for `view` when `path` is a file. If omitted, shows the full file. "
+                                "Provide `[start, end]` (1-based). Use `[start, -1]` to show from start to EOF."
+                            ),
+                            "items": {"type": "integer"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                    },
+                    "required": ["command", "path"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "_state_anthropic",
+                "description": "Internal helper to manage persistent editor state across tool calls.",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "submit",
+                "description": (
+                    "Submits the current file. "
+                    "Note: implementation may use internal flags (e.g., a hidden '-f') not exposed here."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Runs the given command directly in bash.",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute.",
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        formatted_messages = []
+        for message in sample["messages"]:
+            formatted_message = {
+                "role": message["role"],
+                "content": message["content"],
+            }
+            if message["tool_calls"] is not None:
+                formatted_message["tool_calls"] = []
+                for tool_call in message["tool_calls"]:
+                    formatted_message["tool_calls"].append(
+                        {
+                            "function": {
+                                "arguments": tool_call["function"]["arguments"],
+                                "name": tool_call["function"]["name"],
+                            },
+                            "id": f"chatcmpl-tool-{uuid.uuid4()}",
+                            "type": "function",
+                        }
+                    )
+            formatted_messages.append(formatted_message)
+
+        return {
+            "messages": formatted_messages,
+            "tools": SWESmithTrajectoriesDataset.tools,
+        }
 
 
 DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
@@ -432,4 +733,7 @@ DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
     "theblackcat102/evol-codealpaca-v1": CodeAlpacaChatDataset,
     "euclaise/WritingPrompts_curated": WritingPromptsChatDataset,
     "allenai/tulu-3-sft-personas-math": PersonasMathChatDataset,
+    "open-r1/Mixture-of-Thoughts": MixtureOfThoughtsDataset,
+    "Salesforce/xlam-function-calling-60k": XLamFunctionCallingDataset,
+    "SWE-bench/SWE-smith-trajectories": SWESmithTrajectoriesDataset,
 }

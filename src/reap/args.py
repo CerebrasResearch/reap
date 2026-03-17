@@ -75,16 +75,15 @@ class DatasetArgs:
     dataset_name: str = field(
         default="theblackcat102/evol-codealpaca-v1",
         metadata={
-            "help": "Name of the dataset to use.",
-            "choices": [
-                "m-a-p/CodeFeedback-Filtered-Instruction",
-                "ise-uiuc/Magicoder-Evol-Instruct-110K",
-                "allenai/c4",
-                "theblackcat102/evol-codealpaca-v1",
-                "euclaise/WritingPrompts_curated",
-                "allenai/tulu-3-sft-personas-math",
-                "combined"
-            ],
+            "help": (
+                "Name of the dataset to use. Can be a single HuggingFace dataset name "
+                "(e.g., 'theblackcat102/evol-codealpaca-v1') or a composite specification "
+                "with comma-separated entries of <dataset>[<split>]:<num_samples>. "
+                "Example: 'theblackcat102/evol-codealpaca-v1:4096,"
+                "open-r1/Mixture-of-Thoughts[code]:4096,"
+                "open-r1/Mixture-of-Thoughts[math]:4096'. "
+                "Use 'combined' to load pre-recorded combined observation data."
+            ),            
         },
     )
     dataset_config_name: str = field(

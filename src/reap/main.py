@@ -35,7 +35,7 @@ from reap.args import (
     MergeArgs,
 )
 from reap.merge import MergeMethod, MoEExpertMerger
-from reap.data import DATASET_REGISTRY
+from reap.data import DATASET_REGISTRY, parse_composite_dataset_spec
 from reap.observer import OBSERVER_CONFIG_REGISTRY, MoETransformerObserver
 from reap.cluster import (
     get_penalty_vector,
@@ -46,9 +46,15 @@ from reap.cluster import (
     multi_layer_kmeans_clustering,
     multi_layer_kmeans_clustering_on_ca,
     restricted_hierarchical_clustering,
-    kmeans_clustering
+    kmeans_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+)
 from reap.eval import run_evaluate
 from reap.cluster_plots import plot_cluster_analysis
 from reap.metrics import get_distance_fn
@@ -80,13 +86,26 @@ def str_to_directory_name(s: str) -> str:
 
 
 def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path:
-    """Create a clean directory name from model and dataset names."""
-    model_clean = model_name.split("/")[-1]
-    dataset_clean = dataset_name.split("/")[-1]
+    """Create a clean directory name from model and dataset names.
 
-    # Create clean directory name by removing special characters
+    For composite dataset specs (comma-separated), uses a short hash of the
+    full spec as the directory name: ``composite_<md5[:8]>``.
+    """
+    import hashlib
+
+    model_clean = model_name.split("/")[-1]
     model_clean = str_to_directory_name(model_clean)
-    dataset_clean = str_to_directory_name(dataset_clean)
+
+    if "," in dataset_name:
+        # Composite dataset spec — use hash-based directory name
+        spec_hash = hashlib.md5(dataset_name.encode()).hexdigest()[:8]
+        dataset_clean = f"composite_{spec_hash}"
+        logger.info(
+            f"Composite dataset spec detected. Using directory name: {dataset_clean}"
+        )
+    else:
+        dataset_clean = dataset_name.split("/")[-1]
+        dataset_clean = str_to_directory_name(dataset_clean)
 
     results_dir = pathlib.Path("./artifacts") / model_clean / dataset_clean
 
@@ -97,6 +116,175 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
         logger.info(f"Created artifacts directory: {results_dir}")
 
     return results_dir
+
+
+def _setup_observer(model, obs_args):
+    """Create and return an MoETransformerObserver for the given model."""
+    try:
+        renormalize_router_weights = (
+            getattr(model.config, "norm_topk_prob", False)
+            and obs_args.renormalize_router_weights
+        )
+        if renormalize_router_weights:
+            logger.info("Renormalizing topk router weights to sum to 1.")
+        observer_config = OBSERVER_CONFIG_REGISTRY[model.__class__.__name__](
+            distance_measure="cosine",
+            renormalize_router_weights=renormalize_router_weights,
+            record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
+        )
+    except KeyError:
+        raise ValueError(
+            f"No observer configuration registered for model '{model.__class__.__name__}'. "
+            f"Supported: {list(OBSERVER_CONFIG_REGISTRY.keys())}"
+        )
+    return MoETransformerObserver(
+        model=model,
+        hook_config=observer_config,
+    )
+
+
+def _profile_model(model, tokenizer, model_args, obs_args, observer):
+    """Run a profiling forward pass to avoid OOM at inference time."""
+    with torch.no_grad():
+        try:
+            model_max_length = obs_args.model_max_length
+            if model_max_length is None:
+                model_max_length = tokenizer.model_max_length
+            logger.info(f"Profiling at model max length: {model_max_length}.")
+            s = "hello " * model_max_length
+            tokenized = tokenizer(
+                [s],
+                return_tensors="pt",
+                truncation=True,
+                max_length=model_max_length,
+            )
+            tokenized = {k: v.to(model.device) for k, v in tokenized.items()}
+            for _ in range(2):
+                _ = model(**tokenized)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to run model with max input length {model_max_length}: {e}"
+            )
+    logger.info(
+        f"Model {model_args.model_name} successfully loaded and profiled at max length {model_max_length}."
+    )
+    observer.reset()
+
+
+def _load_raw_dataset(dataset_name, split):
+    """Load a raw HuggingFace dataset, handling special cases like C4."""
+    try:
+        if dataset_name == "allenai/c4":
+            file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
+            return load_dataset(
+                "json", data_files={"train": file_url}, split="train", streaming=False
+            )
+        else:
+            return load_dataset(dataset_name, split=split)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load dataset '{dataset_name}' (split={split}): {e}"
+        )
+
+
+def _record_activations_composite(
+    model,
+    tokenizer,
+    reap_args,
+    model_args,
+    ds_args,
+    obs_args,
+    results_dir,
+    composite_components,
+):
+    """Record activations for a composite dataset specification.
+
+    Loads each component dataset sequentially and feeds samples through the
+    model, accumulating observer statistics across all components without
+    resetting. Produces a single combined observation file.
+    """
+    cat_dir = results_dir / "all"
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    f_name = cat_dir / obs_args.output_file_name
+
+    if f_name.exists() and not obs_args.overwrite_observations:
+        logger.info(
+            f"Composite observation already exists at {f_name}. Loading cached result."
+        )
+        return torch.load(f_name, weights_only=False)
+
+    # Set up observer
+    observer = _setup_observer(model, obs_args)
+
+    if reap_args.profile:
+        _profile_model(model, tokenizer, model_args, obs_args, observer)
+
+    total_samples = sum(c.num_samples for c in composite_components)
+    logger.info(
+        f"Recording activations for composite dataset with {len(composite_components)} "
+        f"components, {total_samples} total samples."
+    )
+
+    # Feed each component through the model sequentially, accumulating in
+    # the observer without resetting between components.
+    with torch.no_grad():
+        for comp_idx, component in enumerate(composite_components):
+            comp_label = f"{component.name}[{component.split}]"
+            logger.info(
+                f"[{comp_idx + 1}/{len(composite_components)}] Loading component: "
+                f"{comp_label} ({component.num_samples} samples)"
+            )
+
+            # Load raw dataset
+            raw_ds = _load_raw_dataset(component.name, component.split)
+
+            # Look up processor
+            proc_cls = DATASET_REGISTRY.get(component.name)
+            if proc_cls is None:
+                raise ValueError(
+                    f"No DatasetProcessor registered for '{component.name}'. "
+                    f"Supported: {list(DATASET_REGISTRY.keys())}"
+                )
+
+            # Process dataset
+            processor = proc_cls(
+                dataset=raw_ds,
+                tokenizer=tokenizer,
+                max_input_len=obs_args.model_max_length,
+                split=component.split,
+                split_by_category=False,  # always "all" for composite
+                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+                truncate=obs_args.truncate,
+            )
+            category_data_batches = processor.get_processed_dataset(
+                samples_per_category=component.num_samples,
+            )
+
+            # Feed through model (observer accumulates)
+            for cat_data in category_data_batches.values():
+                try:
+                    for sample in tqdm(
+                        cat_data,
+                        desc=f"Processing {comp_label} samples",
+                    ):
+                        model(sample.to(model.device))
+                except Exception as e:
+                    logger.error(f"Error processing composite component '{comp_label}'")
+                    observer.save_state(cat_dir / "partial.pkl")
+                    logger.info(f"Partial results saved to {cat_dir / 'partial.pkl'}")
+                    raise e
+
+            logger.info(f"Finished component: {comp_label}")
+            # NOTE: No observer.reset() here — accumulate across components
+
+    # Save the combined observation
+    observer.save_state(f_name)
+    observer.close_hooks()
+    logger.info(f"Composite observation saved to {f_name}")
+
+    with open(f_name, "rb") as f:
+        observer_data = torch.load(f, weights_only=False)
+    return observer_data
 
 
 def record_activations(
@@ -112,17 +300,25 @@ def record_activations(
             raise RuntimeError(
                 f"Combined dataset requested but no pre-recorded data found at {f_name}"
             )
-    try:
-        if ds_args.dataset_name == "allenai/c4":
-            file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
-            c4_single_file_dataset = load_dataset(
-                "json", data_files={"train": file_url}, split="train", streaming=False
-            )
-            raw_ds = c4_single_file_dataset
-        else:
-            raw_ds = load_dataset(ds_args.dataset_name, split=ds_args.split)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load dataset '{ds_args.dataset_name}': {e}")
+
+    # check for composite dataset specification
+    composite_components = parse_composite_dataset_spec(
+        ds_args.dataset_name, default_split=ds_args.split
+    )
+    if composite_components is not None:
+        return _record_activations_composite(
+            model,
+            tokenizer,
+            reap_args,
+            model_args,
+            ds_args,
+            obs_args,
+            results_dir,
+            composite_components,
+        )
+
+    # single dataset path
+    raw_ds = _load_raw_dataset(ds_args.dataset_name, ds_args.split)
 
     # load dataset processor
     proc_cls = DATASET_REGISTRY.get(ds_args.dataset_name)
@@ -151,52 +347,10 @@ def record_activations(
     )
 
     # load observer and hook model
-    try:
-        renormalize_router_weights = getattr(model.config, "norm_topk_prob", False) and obs_args.renormalize_router_weights
-        if renormalize_router_weights:
-            logger.info("Renormalizing topk router weights to sum to 1.")
-        observer_config = OBSERVER_CONFIG_REGISTRY[model.__class__.__name__](
-            # distance_measure=obs_args.distance_measure,
-            distance_measure='cosine',
-            renormalize_router_weights=renormalize_router_weights,
-            record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
-        )
-    except KeyError:
-        raise ValueError(
-            f"No observer configuration registered for model '{model.__class__.__name__}'. "
-            f"Supported: {list(OBSERVER_CONFIG_REGISTRY.keys())}"
-        )
-    observer = MoETransformerObserver(
-        model=model,
-        hook_config=observer_config,
-    )
+    observer = _setup_observer(model, obs_args)
 
     if reap_args.profile:
-        # profile at max len
-        with torch.no_grad():
-            try:
-                model_max_length = obs_args.model_max_length
-                if model_max_length is None:
-                    model_max_length = tokenizer.model_max_length
-                logger.info(f"Profiling at model max length: {model_max_length}.")
-                s = "hello " * model_max_length
-                tokenized = tokenizer(
-                    [s],
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=model_max_length,
-                )
-                tokenized = {k: v.to(model.device) for k, v in tokenized.items()}
-                for _ in range(2):
-                    _ = model(**tokenized)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to run model with max input length {model_max_length}: {e}"
-                )
-        logger.info(
-            f"Model {model_args.model_name} successfully loaded and profiled at max length {model_max_length}."
-        )
-        observer.reset()
+        _profile_model(model, tokenizer, model_args, obs_args, observer)
 
     # run samples over model and save observer state
     with torch.no_grad():
@@ -251,7 +405,9 @@ def cluster(
     distances = {}
     all_layer_expert_proba = {}
     if cluster_args.singleton_super_experts or cluster_args.singleton_outlier_experts:
-        super_expert_idx = get_super_expert_indices(data, include_last_layers=cluster_args.singleton_outlier_experts)
+        super_expert_idx = get_super_expert_indices(
+            data, include_last_layers=cluster_args.singleton_outlier_experts
+        )
     for layer in tqdm(data, "Clustering experts..."):
         expert_prob = data[layer]["expert_frequency"] / data[layer]["total_tokens"]
         ttm_sim_matrix = None
@@ -284,19 +440,24 @@ def cluster(
         }
         distance = expert_similarity_scores[cluster_args.expert_sim]
 
-        if cluster_args.expert_sim in [
-            "characteristic_activation",
-            "routed_characteristic_activation",
-            "router_logits",
-        ] and cluster_args.cluster_method != "kmeans":
+        if (
+            cluster_args.expert_sim
+            in [
+                "characteristic_activation",
+                "routed_characteristic_activation",
+                "router_logits",
+            ]
+            and cluster_args.cluster_method != "kmeans"
+        ):
             # get NxN similarity matrix for vector metrics
             distance_fn = get_distance_fn(distance_measure)
             distance = distance_fn(distance.unsqueeze(0), distance.unsqueeze(1))
 
-        
         if cluster_args.singleton_super_experts:
             # set super expert distance to max
-            super_experts_in_layer = super_expert_idx[super_expert_idx[:, 0] == layer][:, 1]
+            super_experts_in_layer = super_expert_idx[super_expert_idx[:, 0] == layer][
+                :, 1
+            ]
             if len(super_experts_in_layer) > 0:
                 max_value = torch.finfo(distance.dtype).max
                 distance[:, super_experts_in_layer] = max_value
@@ -365,16 +526,18 @@ def cluster(
                 cluster_args.linkage_method,
                 num_clusters,
             )
-        elif cluster_args.cluster_method == "kmeans": 
+        elif cluster_args.cluster_method == "kmeans":
             # try v2:
-            if cluster_args.expert_sim != 'characteristic_activation':
-                raise ValueError("multi_layer kmeans clustering on ca only implemented for characteristic_activation expert sim")
+            if cluster_args.expert_sim != "characteristic_activation":
+                raise ValueError(
+                    "multi_layer kmeans clustering on ca only implemented for characteristic_activation expert sim"
+                )
             cluster_labels = multi_layer_kmeans_clustering_on_ca(
                 distances,
                 num_layers=cluster_args.multi_layer,
                 n_clusters=num_clusters,
             )
-            
+
             # cluster_labels = multi_layer_kmeans_clustering(
             #     distances,
             #     num_layers=cluster_args.multi_layer,
@@ -459,7 +622,9 @@ def save_merged_model(
         model.save_pretrained(merged_model_dir, safe_serialization=safe_serialization)
         tokenizer.save_pretrained(merged_model_dir)
     except Exception as e:
-        import pdb; breakpoint()
+        import pdb
+
+        breakpoint()
     end = time.time()
     logger.info(
         f"Merged model saved to {merged_model_dir} in {end - start:.2f} seconds"
@@ -503,7 +668,7 @@ def get_model_dir(
         if cluster_args.max_cluster_size is not None:
             cluster_desc += f"_max_size-{cluster_args.max_cluster_size}"
     merge_model_subdir_name = merge_args.merged_model_dir_name
-    
+
     if not merge_model_subdir_name:
         merge_model_subdir_name = f"{merge_args.merge_method}-permute_{merge_args.permute}-skip_first_{merge_args.skip_first}-skip_last_{merge_args.skip_last}-multilayer_{cluster_args.multi_layer}"
 
