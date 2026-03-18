@@ -110,6 +110,7 @@ class ObserverArgs:
             )
         },
     )
+    batch_size: int = 1
     model_max_length: int | None = 2048
     return_vllm_tokens_prompt: bool = False
     truncate: bool = False

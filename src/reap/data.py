@@ -25,7 +25,7 @@ import logging
 
 
 import torch
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
 from vllm import TokensPrompt
 
@@ -129,6 +129,60 @@ def parse_composite_dataset_spec(
     return components
 
 
+def _load_raw_dataset(dataset_name, split):
+    """Load a raw HuggingFace dataset, handling special cases like C4."""
+    try:
+        if dataset_name == "allenai/c4":
+            file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
+            return load_dataset(
+                "json", data_files={"train": file_url}, split="train", streaming=False
+            )
+        else:
+            return load_dataset(dataset_name, split=split)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load dataset '{dataset_name}' (split={split}): {e}"
+        )
+
+
+def load_category_batches(
+    dataset_name, 
+    split, 
+    tokenizer, 
+    model_max_length,
+    batch_size,
+    split_by_category,
+    return_vllm_tokens_prompt,
+    truncate,
+    samples_per_category,
+):
+    raw_ds = _load_raw_dataset(dataset_name, split)
+
+    # load dataset processor
+    proc_cls = DATASET_REGISTRY.get(dataset_name)
+    if proc_cls is None:
+        raise ValueError(
+            f"No DatasetProcessor registered for '{dataset_name}'. "
+            f"Supported: {list(DATASET_REGISTRY.keys())}"
+        )
+
+    # init processor & process dataset
+    processor = proc_cls(
+        dataset=raw_ds,
+        tokenizer=tokenizer,
+        max_input_len=model_max_length,
+        split=split,
+        split_by_category=split_by_category,
+        return_vllm_tokens_prompt=return_vllm_tokens_prompt,
+        truncate=truncate,
+        batch_size=batch_size,        
+    )
+    category_data_batches = processor.get_processed_dataset(
+        samples_per_category=samples_per_category,
+    )
+    return category_data_batches
+
+
 # --- Base Dataset Processors --------------------------------------------------
 
 
@@ -152,6 +206,7 @@ class BaseDatasetProcessor(ABC):
         return_vllm_tokens_prompt: bool = False,
         truncate: bool = False,
         select_only_categories: list[str] | str | None = None,
+        batch_size: int = 1,
     ):
         """Defines base functionality for all Dataset Processors.
 
@@ -164,6 +219,7 @@ class BaseDatasetProcessor(ABC):
                 TokensPrompt objects instead of BatchEncoding. Defaults to False
             truncate (bool, optional): If True, will truncate the samples from
                 the dataset to the max_input_len instead of skipping them.
+            batch_size (int, optional): Number of samples per batch. Defaults to 1.
 
         """
         if isinstance(dataset, DatasetDict):
@@ -192,6 +248,7 @@ class BaseDatasetProcessor(ABC):
         if isinstance(select_only_categories, str):
             select_only_categories = [select_only_categories]
         self.select_only_categories = select_only_categories
+        self.batch_size = batch_size
         if self.select_only_categories:
             logger.warning(
                 "select_only_categories is not None but split_by_category "
@@ -285,6 +342,58 @@ class BaseDatasetProcessor(ABC):
                 category, samples_per_category, category_dataset
             )
 
+    def _collate_batch(self, batch: list[dict[str, torch.Tensor]]) -> BatchEncoding:
+        """Collate a list of tokenized samples into a padded batch.
+
+        Args:
+            batch: List of dicts, each containing:
+                - "input_ids": Tensor with shape (1, seq_len)
+                - "attention_mask": Tensor with shape (1, seq_len)
+
+        Returns:
+            BatchEncoding with:
+                - input_ids: Tensor of shape (batch_size, max_seq_len)
+                - attention_mask: Tensor of shape (batch_size, max_seq_len)
+        """
+        max_len = max(sample["input_ids"].shape[-1] for sample in batch)
+        pad_token_id = self.tokenizer.pad_token_id or 0
+
+        padded_input_ids = []
+        padded_attention_masks = []
+
+        for sample in batch:
+            input_ids = sample["input_ids"]
+            attention_mask = sample["attention_mask"]
+
+            seq_len = input_ids.shape[-1]
+            padding_len = max_len - seq_len
+
+            if padding_len > 0:
+                input_padding = torch.full(
+                    (input_ids.shape[0], padding_len),
+                    pad_token_id,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+                mask_padding = torch.zeros(
+                    (attention_mask.shape[0], padding_len),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+
+                input_ids = torch.cat([input_ids, input_padding], dim=-1)
+                attention_mask = torch.cat([attention_mask, mask_padding], dim=-1)
+
+            padded_input_ids.append(input_ids)
+            padded_attention_masks.append(attention_mask)
+
+        return BatchEncoding(
+            {
+                "input_ids": torch.cat(padded_input_ids, dim=0),
+                "attention_mask": torch.cat(padded_attention_masks, dim=0),
+            }
+        )
+
     def _process_samples_for_category_unpacked(
         self,
         category: str,
@@ -293,6 +402,7 @@ class BaseDatasetProcessor(ABC):
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         processed_samples = []
         sampled = []  # sample without replacement
+        current_batch = []
         while len(processed_samples) < samples_per_category:
             if len(sampled) >= len(category_dataset):
                 logger.warning(
@@ -312,12 +422,25 @@ class BaseDatasetProcessor(ABC):
                     encoded_sample = encoded_sample[:, : self.max_input_len]
                 else:
                     continue
+            attention_mask = torch.ones((1, encoded_sample.shape[-1]), dtype=torch.long)
 
             if self.return_vllm_tokens_prompt:
                 encoded_sample = TokensPrompt(
                     prompt_token_ids=encoded_sample[0, :-1].tolist()
                 )
-            processed_samples.append(encoded_sample)
+                processed_samples.append(encoded_sample)
+            else:
+                current_batch.append({"input_ids": encoded_sample, "attention_mask": attention_mask})
+                if len(current_batch) >= self.batch_size:
+                    batched = self._collate_batch(current_batch)
+                    processed_samples.append(batched)
+                    current_batch = []
+
+        # handle remaining samples in the last batch
+        if current_batch and not self.return_vllm_tokens_prompt:
+            batched = self._collate_batch(current_batch)
+            processed_samples.append(batched)
+
         return processed_samples
 
     def _process_samples_for_category_packed(
@@ -328,6 +451,7 @@ class BaseDatasetProcessor(ABC):
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         processed_samples = []
         sampled = []
+        current_batch = []
         while len(processed_samples) < samples_per_category:
             if len(sampled) >= len(category_dataset):
                 logger.warning(
@@ -338,6 +462,7 @@ class BaseDatasetProcessor(ABC):
                 break
             seq = torch.zeros((1, self.max_input_len), dtype=torch.long)
             seq_idx = 0
+            attention_mask = torch.zeros((1, self.max_input_len), dtype=torch.long)
             while seq_idx < self.max_input_len:
                 if len(sampled) >= len(category_dataset):
                     logger.warning(
@@ -355,14 +480,25 @@ class BaseDatasetProcessor(ABC):
                     encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]
                     end_seq = self.max_input_len
                 seq[:, seq_idx:end_seq] = encoded_sample
+                attention_mask[:, seq_idx:end_seq] = 1
                 seq_idx = end_seq + 1
             if self.return_vllm_tokens_prompt:
                 encoded_sample = TokensPrompt(
                     prompt_token_ids=seq[0, :-1].tolist()  # -1 for vLLM.LLM.generate
                 )
+                processed_samples.append(encoded_sample)
             else:
-                encoded_sample = seq
-            processed_samples.append(encoded_sample)
+                current_batch.append({"input_ids": seq, "attention_mask": attention_mask})
+                if len(current_batch) >= self.batch_size:
+                    batched = self._collate_batch(current_batch)
+                    processed_samples.append(batched)
+                    current_batch = []
+
+        # handle remaining samples in the last batch
+        if current_batch and not self.return_vllm_tokens_prompt:
+            batched = self._collate_batch(current_batch)
+            processed_samples.append(batched)
+
         return processed_samples
 
 

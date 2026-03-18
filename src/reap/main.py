@@ -14,10 +14,7 @@ import shutil
 import numpy as np
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
-import seaborn as sns
 from tqdm import tqdm
-from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 
 from accelerate.utils import set_seed
@@ -35,7 +32,7 @@ from reap.args import (
     MergeArgs,
 )
 from reap.merge import MergeMethod, MoEExpertMerger
-from reap.data import DATASET_REGISTRY, parse_composite_dataset_spec
+from reap.data import load_category_batches, parse_composite_dataset_spec
 from reap.observer import OBSERVER_CONFIG_REGISTRY, MoETransformerObserver
 from reap.cluster import (
     get_penalty_vector,
@@ -171,22 +168,6 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
     observer.reset()
 
 
-def _load_raw_dataset(dataset_name, split):
-    """Load a raw HuggingFace dataset, handling special cases like C4."""
-    try:
-        if dataset_name == "allenai/c4":
-            file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
-            return load_dataset(
-                "json", data_files={"train": file_url}, split="train", streaming=False
-            )
-        else:
-            return load_dataset(dataset_name, split=split)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load dataset '{dataset_name}' (split={split}): {e}"
-        )
-
-
 def _record_activations_composite(
     model,
     tokenizer,
@@ -235,29 +216,16 @@ def _record_activations_composite(
                 f"{comp_label} ({component.num_samples} samples)"
             )
 
-            # Load raw dataset
-            raw_ds = _load_raw_dataset(component.name, component.split)
-
-            # Look up processor
-            proc_cls = DATASET_REGISTRY.get(component.name)
-            if proc_cls is None:
-                raise ValueError(
-                    f"No DatasetProcessor registered for '{component.name}'. "
-                    f"Supported: {list(DATASET_REGISTRY.keys())}"
-                )
-
-            # Process dataset
-            processor = proc_cls(
-                dataset=raw_ds,
-                tokenizer=tokenizer,
-                max_input_len=obs_args.model_max_length,
-                split=component.split,
-                split_by_category=False,  # always "all" for composite
+            category_data_batches = load_category_batches(
+                dataset_name=component.name, 
+                split=component.split, 
+                tokenizer=tokenizer, 
+                model_max_length=obs_args.model_max_length,
+                split_by_category=False, # always "all" for composite
                 return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
                 truncate=obs_args.truncate,
-            )
-            category_data_batches = processor.get_processed_dataset(
                 samples_per_category=component.num_samples,
+                batch_size=obs_args.batch_size,
             )
 
             # Feed through model (observer accumulates)
@@ -267,7 +235,15 @@ def _record_activations_composite(
                         cat_data,
                         desc=f"Processing {comp_label} samples",
                     ):
-                        model(sample.to(model.device))
+                        # Set attention mask for observer to filter padding tokens
+                        attention_mask = sample.get("attention_mask", None)
+                        observer.set_attention_mask(attention_mask)
+                        sample = {
+                            k: v.to(model.device) if torch.is_tensor(v) else v
+                            for k, v in sample.items()
+                        }
+                        model(**sample)
+                        observer.clear_attention_mask()
                 except Exception as e:
                     logger.error(f"Error processing composite component '{comp_label}'")
                     observer.save_state(cat_dir / "partial.pkl")
@@ -317,35 +293,23 @@ def record_activations(
             composite_components,
         )
 
-    # single dataset path
-    raw_ds = _load_raw_dataset(ds_args.dataset_name, ds_args.split)
-
-    # load dataset processor
-    proc_cls = DATASET_REGISTRY.get(ds_args.dataset_name)
-    if proc_cls is None:
-        raise ValueError(
-            f"No DatasetProcessor registered for '{ds_args.dataset_name}'. "
-            f"Supported: {list(DATASET_REGISTRY.keys())}"
-        )
-
-    # init processor & process dataset
-    processor = proc_cls(
-        dataset=raw_ds,
-        tokenizer=tokenizer,
-        max_input_len=obs_args.model_max_length,
-        split=ds_args.split,
+    category_data_batches = load_category_batches(
+        dataset_name=ds_args.dataset_name, 
+        split=ds_args.split, 
+        tokenizer=tokenizer, 
+        model_max_length=obs_args.model_max_length,
         split_by_category=obs_args.split_by_category,
         return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
         truncate=obs_args.truncate,
-    )
-    category_data_batches = processor.get_processed_dataset(
         samples_per_category=obs_args.samples_per_category,
+        batch_size=obs_args.batch_size,
     )
+
     logger.info(
         "Loaded and processed data for categories: %s",
         str(list(category_data_batches.keys())),
     )
-
+    
     # load observer and hook model
     observer = _setup_observer(model, obs_args)
 
@@ -367,7 +331,14 @@ def record_activations(
             try:
                 logger.info("No previous data found @ %s", f_name)
                 for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
-                    model(sample.to(model.device))
+                    attention_mask = sample.get("attention_mask", None)
+                    observer.set_attention_mask(attention_mask)
+                    sample = {
+                        k: v.to(model.device) if torch.is_tensor(v) else v
+                        for k, v in sample.items()
+                    }
+                    model(**sample)
+                    observer.clear_attention_mask()
             except Exception as e:
                 logger.error(f"Error processing category '{category}'")
                 logger.info(

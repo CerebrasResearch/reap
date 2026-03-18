@@ -227,6 +227,26 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
 class MoETransformerObserver(BaseTransformerObserver):
     """MoE Transformer Observer for all methods including both pruning and merging."""
 
+    def __init__(self, model, hook_config=None):
+        self._current_attention_mask: Optional[torch.Tensor] = None
+        super().__init__(model, hook_config)
+
+    def set_attention_mask(self, attention_mask: Optional[torch.Tensor]):
+        """Set the attention mask for the current forward pass.
+
+        This must be called before each forward pass when using batched inputs
+        with padding, to ensure padding tokens are excluded from statistics.
+
+        Args:
+            attention_mask: Tensor of shape (batch_size, seq_len) with 1 for real
+                tokens and 0 for padding tokens. Can be None for unbatched inputs.
+        """
+        self._current_attention_mask = attention_mask
+
+    def clear_attention_mask(self):
+        """Clear the attention mask after forward pass."""
+        self._current_attention_mask = None
+
     def report_state(self) -> dict[str, Any]:
         """
         Method to report the current state of the observer. Can be overridden to inject
@@ -350,6 +370,15 @@ class MoETransformerObserver(BaseTransformerObserver):
                 self.state[layer_number] = self._initialize_state(output, num_experts)
             batch_size, sequence_length, hidden_dim = input.shape
             flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
+
+            attention_mask = self._current_attention_mask
+            if attention_mask is not None:
+                # Flatten mask to match flat_input: (batch_size * seq_len,)
+                flat_mask = attention_mask.view(-1).bool().to(device)
+            else:
+                # No mask provided - treat all tokens as valid
+                flat_mask = None
+
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
             if self.hook_config.fused_experts:
@@ -384,7 +413,19 @@ class MoETransformerObserver(BaseTransformerObserver):
                     )  # (num_experts, total_seq_len, hidden_dim)
 
             del flat_input
-            num_tokens = batch_size * sequence_length
+            
+            # Filter out padding tokens if attention mask is provided
+            if flat_mask is not None:
+                num_tokens = flat_mask.sum().item()
+                # Filter selected_experts: (total_tokens, top_k) -> (num_valid_tokens, top_k)
+                selected_experts = selected_experts[flat_mask]
+                # Filter activations: (num_experts, total_tokens, hidden_dim) -> (num_experts, num_valid_tokens, hidden_dim)
+                activations = activations[:, flat_mask, :]
+                # Filter router_logits: (total_tokens, num_experts) -> (num_valid_tokens, num_experts)
+                router_logits = router_logits[flat_mask]
+            else:
+                num_tokens = batch_size * sequence_length
+
             num_tokens = torch.tensor(num_tokens, device="cpu", dtype=torch.long)
 
             # --- PRUNE/MERGE SALIENCY CRITERIA --------------------------------
