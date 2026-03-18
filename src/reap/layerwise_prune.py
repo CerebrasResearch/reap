@@ -26,6 +26,7 @@ import time
 import logging
 import dataclasses
 import pathlib
+import hashlib
 from typing import Any, Dict, List
 import yaml
 
@@ -45,7 +46,7 @@ from reap.args import (
     ClusterArgs,
     LayerwiseArgs,
 )
-from reap.data import load_category_batches
+from reap.data import load_category_batches, parse_composite_dataset_spec
 from reap.model_util import (
     get_moe,
     MODEL_ATTRS,
@@ -69,10 +70,17 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
         return re.sub(r"[^\w\-_.]", "_", s)
 
     model_clean = model_name.split("/")[-1]
-    dataset_clean = dataset_name.split("/")[-1]
-
     model_clean = str_to_directory_name(model_clean)
-    dataset_clean = str_to_directory_name(dataset_clean)
+
+    if "," in dataset_name:
+        spec_hash = hashlib.md5(dataset_name.encode()).hexdigest()[:8]
+        dataset_clean = f"composite_{spec_hash}"
+        logger.info(
+            f"Composite dataset spec detected. Using directory name: {dataset_clean}"
+        )
+    else:
+        dataset_clean = dataset_name.split("/")[-1]
+        dataset_clean = str_to_directory_name(dataset_clean)
 
     results_dir = pathlib.Path("./artifacts") / model_clean / dataset_clean
 
@@ -83,6 +91,19 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
         logger.info(f"Created artifacts directory: {results_dir}")
 
     return results_dir
+
+
+def _get_observer_output_path(
+    results_dir: pathlib.Path,
+    dataset_name: str,
+    output_file_name: str,
+) -> pathlib.Path:
+    if (
+        dataset_name == "combined"
+        or parse_composite_dataset_spec(dataset_name) is not None
+    ):
+        return results_dir / "all" / output_file_name
+    return results_dir / "layerwise" / output_file_name
 
 
 def prepare_calibration_batches(
@@ -96,6 +117,41 @@ def prepare_calibration_batches(
     Returns a list of tokenized input tensors.
     """
     logger.info(f"Loading dataset {ds_args.dataset_name}...")
+
+    composite_components = parse_composite_dataset_spec(
+        ds_args.dataset_name, default_split=ds_args.split
+    )
+
+    if composite_components is not None:
+        all_batches = []
+        total_samples = sum(component.num_samples for component in composite_components)
+        logger.info(
+            f"Preparing composite calibration data with {len(composite_components)} "
+            f"components, {total_samples} total samples."
+        )
+
+        for component in composite_components:
+            comp_label = f"{component.name}[{component.split}]"
+            logger.info(
+                f"Loading composite component {comp_label} ({component.num_samples} samples)"
+            )
+            category_data_batches = load_category_batches(
+                dataset_name=component.name,
+                split=component.split,
+                tokenizer=tokenizer,
+                model_max_length=obs_args.model_max_length,
+                split_by_category=False,
+                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+                truncate=obs_args.truncate,
+                samples_per_category=component.num_samples,
+                batch_size=obs_args.batch_size,
+            )
+            for category, batches in category_data_batches.items():
+                all_batches.extend(batches)
+                logger.info(f"Added {len(batches)} batches from category: {category}")
+
+        logger.info(f"Total calibration batches: {len(all_batches)}")
+        return all_batches
 
     category_data_batches = load_category_batches(
         dataset_name=ds_args.dataset_name,
@@ -123,6 +179,7 @@ def record_activations_layerwise(
     model,
     tokenizer,
     data_batches: List[torch.Tensor],
+    ds_args: DatasetArgs,
     obs_args: ObserverArgs,
     layerwise_args: LayerwiseArgs,
     results_dir: pathlib.Path,
@@ -170,7 +227,12 @@ def record_activations_layerwise(
 
     # Process all blocks
     save_path = (
-        results_dir / "layerwise_intermediate"
+        _get_observer_output_path(
+            results_dir,
+            ds_args.dataset_name,
+            obs_args.output_file_name,
+        ).parent
+        / "layerwise_intermediate"
         if layerwise_args.save_intermediate
         else None
     )
@@ -181,7 +243,11 @@ def record_activations_layerwise(
     )
 
     # Save complete state
-    output_file = results_dir / "layerwise" / obs_args.output_file_name
+    output_file = _get_observer_output_path(
+        results_dir,
+        ds_args.dataset_name,
+        obs_args.output_file_name,
+    )
     observer.save_state(output_file)
 
     logger.info(f"Layerwise activation recording complete. Saved to {output_file}")
@@ -416,42 +482,58 @@ def main():
     # Load tokenizer
     logger.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = None
 
-    # Prepare calibration samples
-    logger.info("Preparing calibration samples...")
-    data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
-
-    # Load model on CPU for layerwise processing
-    logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="cpu",
-        torch_dtype="auto",
-        trust_remote_code=True,
-        low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+    cached_data_path = _get_observer_output_path(
+        results_dir,
+        ds_args.dataset_name,
+        obs_args.output_file_name,
     )
-    model.eval()
 
-    logger.info(f"Model loaded: {model.__class__.__name__}")
-    num_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Total parameters: {num_params / 1e9:.2f}B")
-
-    # Check for cached observer data
-    cached_data_path = results_dir / "layerwise" / obs_args.output_file_name
-    if cached_data_path.exists() and not obs_args.overwrite_observations:
-        logger.info(f"Loading cached observer data from {cached_data_path}")
-        observer_data = torch.load(cached_data_path, weights_only=False)
+    if ds_args.dataset_name == "combined":
+        if cached_data_path.exists():
+            logger.info(f"Loading cached observer data from {cached_data_path}")
+            observer_data = torch.load(cached_data_path, weights_only=False)
+        else:
+            raise RuntimeError(
+                f"Combined dataset requested but no pre-recorded data found at {cached_data_path}"
+            )
     else:
-        # Record activations using layerwise processing
-        logger.info("Recording activations using layerwise processing...")
-        observer_data = record_activations_layerwise(
-            model,
-            tokenizer,
-            data_batches,
-            obs_args,
-            layerwise_args,
-            results_dir,
+        # Prepare calibration samples
+        logger.info("Preparing calibration samples...")
+        data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
+
+        # Load model on CPU for layerwise processing
+        logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cpu",
+            torch_dtype="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
         )
+        model.eval()
+
+        logger.info(f"Model loaded: {model.__class__.__name__}")
+        num_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"Total parameters: {num_params / 1e9:.2f}B")
+
+        # Check for cached observer data
+        if cached_data_path.exists() and not obs_args.overwrite_observations:
+            logger.info(f"Loading cached observer data from {cached_data_path}")
+            observer_data = torch.load(cached_data_path, weights_only=False)
+        else:
+            # Record activations using layerwise processing
+            logger.info("Recording activations using layerwise processing...")
+            observer_data = record_activations_layerwise(
+                model,
+                tokenizer,
+                data_batches,
+                ds_args,
+                obs_args,
+                layerwise_args,
+                results_dir,
+            )
 
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True)")
@@ -499,7 +581,8 @@ def main():
     else:
         # Reload model on auto device for pruning
         logger.info("Reloading model on GPU for pruning...")
-        del model
+        if model is not None:
+            del model
         cleanup_memory()
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -541,7 +624,8 @@ def main():
     # Evaluation
     if reap_args.do_eval:
         logger.info("Starting evaluation...")
-        del model
+        if model is not None:
+            del model
         del observer_data
         cleanup_memory()
 
