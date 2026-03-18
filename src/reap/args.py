@@ -530,6 +530,57 @@ class PruneArgs:
         }
     )
 
+
+@dataclass
+class LayerwiseArgs:
+    """Arguments for layerwise (memory-efficient) calibration."""
+
+    use_layerwise: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use layerwise calibration instead of full model loading. "
+                "This is memory-efficient and allows calibrating large models on single GPU."
+            )
+        },
+    )
+    save_intermediate: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to save intermediate results after each block during layerwise "
+                "calibration. Useful for debugging and recovery."
+            )
+        },
+    )
+    aggressive_cleanup: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to aggressively clean up GPU memory between blocks. "
+                "Recommended for large models."
+            )
+        },
+    )
+    max_gpu_memory: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum GPU memory to use (e.g., '20GB'). If None, uses default "
+                "based on model size detection."
+            )
+        },
+    )
+    low_cpu_mem_usage: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Use memory-efficient model loading. Recommended for large models."
+            )
+        },
+    )
+
+
 @dataclass
 class QuantizationArgs:
     quantization_method: str = field(
