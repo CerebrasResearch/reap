@@ -1,6 +1,7 @@
 # Router-weighted Expert Activation Pruning (REAP)
 
 ## Updates
+* 2026-03-19: We have released our data calibration mix recipe for agentic reasoning REAP-compressed models published on HuggingFace (see [details](#huggingface-checkpoints)).
 * 2026-03-11: For REAP saliency, top-k router logits are now correctly renormalized to sum to 1. See `args.py:ObserverArgs.renormalize_router_weights`. Generally, you can expect a modest improvement for most model/datasets with this fix in place. On non-agentic coding evaluations across ERNIE-4.5-21B-A3B-PT, Qwen3-30B-A3B, Mixtral-8x7B-Instruct-v0.1, GLM-4.5-Air,and Llama-4-Scout-17B-16E-Instruct, REAP achieves a mean decrease in accuracy of 1.9% vs. 2.6% without logit normalization. Our prior large-scale results and all Cerebras checkpoints on previously calibrated with normalized logits. 
 * 2026-03-01: REAP has been accepted to ICLR 2026, see you in Rio! 
 
@@ -29,6 +30,21 @@ Expert pruning and merging can be used to reduce the memory overhead of Sparsely
 
 ## <img src="./fig/hf-transparent.png" alt="Cerebras REAP checkpoints" width='20'>  HuggingFace checkpoints
 [REAP model collection on HuggingFace](https://huggingface.co/collections/cerebras/cerebras-reap), including pruned versions of GLM4.6, GLM4.5-Air, Qwen3-Coder-480B, Qwen3-Coder-30B, MiniMax-M2, Kimi-Linear, DeepSeek-V3.2. More to come, stay tuned!
+
+To reproduce our HuggingFace checkpoints, we are releasing the calibration data mix used for agentic reasoner models:
+
+- General coding dataset (4096 samples): [theblackcat102/evol-codealpaca-v1](https://huggingface.co/datasets/theblackcat102/evol-codealpaca-v1)
+- Reasoning dataset (12288 samples, equal parts from code, math, science subsets): [open-r1/Mixture-of-Thoughts](https://huggingface.co/datasets/open-r1/Mixture-of-Thoughts)
+- Single-turn tool calling dataset (4096 samples): [Salesforce/xlam-function-calling-60k](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k)
+- Agentic coding / multi-turn tool calling dataset (4096 samples, tool split): [SWE-bench/SWE-smith-trajectories](https://huggingface.co/datasets/SWE-bench/SWE-smith-trajectories)
+
+Our full calibration set is composed of 24576 samples from the sources above at maximal sequence length equal to 16384 tokens. Composite calibration dataset can be specified in the command line as follows:
+
+```bash
+bash experiments/pruning-cli.sh 0 Qwen/Qwen3-30B-A3B reap 42 0.25 "theblackcat102/evol-codealpaca-v1:4096,Salesforce/xlam-function-calling-60k:4096,open-r1/Mixture-of-Thoughts[code]:4096,open-r1/Mixture-of-Thoughts[math]:4096,open-r1/Mixture-of-Thoughts[science]:4096,SWE-bench/SWE-smith-trajectories(tool):4096" true true false false false
+```
+
+Note that the dataset subsets are specified in square brackets and the split name is specified in curly brackets.
 
 ## Installation
 
