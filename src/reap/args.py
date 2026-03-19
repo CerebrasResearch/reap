@@ -78,16 +78,16 @@ class DatasetArgs:
             "help": (
                 "Name of the dataset to use. Can be a single HuggingFace dataset name "
                 "(e.g., 'theblackcat102/evol-codealpaca-v1') or a composite specification "
-                "with comma-separated entries of <dataset>[<split>]:<num_samples>. "
+                "with comma-separated entries of <dataset>[<subset>](<split>):<num_samples>. "
                 "Example: 'theblackcat102/evol-codealpaca-v1:4096,"
                 "open-r1/Mixture-of-Thoughts[code]:4096,"
-                "open-r1/Mixture-of-Thoughts[math]:4096'. "
+                "SWE-bench/SWE-smith-trajectories(tool):4096'. "
                 "Use 'combined' to load pre-recorded combined observation data."
             ),            
         },
     )
     dataset_config_name: str = field(
-        default="all", metadata={"help": "Configuration name of the dataset."}
+        default=None, metadata={"help": "Configuration name of the dataset."}
     )
     split: str = field(default="train", metadata={"help": "Dataset split to use."})
     shuffle: bool = field(

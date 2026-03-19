@@ -8,6 +8,21 @@ pruning_method=${3:-"reap"}
 seed=${4:-42}
 compression_ratio=${5:-0.25}
 dataset_name=${6:-"theblackcat102/evol-codealpaca-v1"}
+
+artifact_dir_name() {
+    python - "$1" <<'PY'
+import hashlib
+import re
+import sys
+
+value = sys.argv[1]
+if "," in value:
+    print(f"composite_{hashlib.md5(value.encode()).hexdigest()[:8]}")
+else:
+    print(re.sub(r"[^\w\-_.]", "_", value.split("/")[-1]))
+PY
+}
+
 # qa
 run_lm_eval=${7:-true}
 # coding
@@ -48,8 +63,8 @@ python src/reap/prune.py \
     --samples_per_category ${num_samples} \
     --record_pruning_metrics_only true
 
-short_model_name=$(echo $model_name | cut -d'/' -f2)
-short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
+short_model_name=$(artifact_dir_name "$model_name")
+short_dataset_name=$(artifact_dir_name "$dataset_name")
 
 pruned_model_dir_name="${pruning_method}"
 if [[ "${singleton_super_experts}" == "true" ]]; then

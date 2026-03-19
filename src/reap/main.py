@@ -168,101 +168,6 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
     observer.reset()
 
 
-def _record_activations_composite(
-    model,
-    tokenizer,
-    reap_args,
-    model_args,
-    ds_args,
-    obs_args,
-    results_dir,
-    composite_components,
-):
-    """Record activations for a composite dataset specification.
-
-    Loads each component dataset sequentially and feeds samples through the
-    model, accumulating observer statistics across all components without
-    resetting. Produces a single combined observation file.
-    """
-    cat_dir = results_dir / "all"
-    cat_dir.mkdir(parents=True, exist_ok=True)
-    f_name = cat_dir / obs_args.output_file_name
-
-    if f_name.exists() and not obs_args.overwrite_observations:
-        logger.info(
-            f"Composite observation already exists at {f_name}. Loading cached result."
-        )
-        return torch.load(f_name, weights_only=False)
-
-    # Set up observer
-    observer = _setup_observer(model, obs_args)
-
-    if reap_args.profile:
-        _profile_model(model, tokenizer, model_args, obs_args, observer)
-
-    total_samples = sum(c.num_samples for c in composite_components)
-    logger.info(
-        f"Recording activations for composite dataset with {len(composite_components)} "
-        f"components, {total_samples} total samples."
-    )
-
-    # Feed each component through the model sequentially, accumulating in
-    # the observer without resetting between components.
-    with torch.no_grad():
-        for comp_idx, component in enumerate(composite_components):
-            comp_label = f"{component.name}[{component.split}]"
-            logger.info(
-                f"[{comp_idx + 1}/{len(composite_components)}] Loading component: "
-                f"{comp_label} ({component.num_samples} samples)"
-            )
-
-            category_data_batches = load_category_batches(
-                dataset_name=component.name, 
-                split=component.split, 
-                tokenizer=tokenizer, 
-                model_max_length=obs_args.model_max_length,
-                split_by_category=False, # always "all" for composite
-                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
-                truncate=obs_args.truncate,
-                samples_per_category=component.num_samples,
-                batch_size=obs_args.batch_size,
-            )
-
-            # Feed through model (observer accumulates)
-            for cat_data in category_data_batches.values():
-                try:
-                    for sample in tqdm(
-                        cat_data,
-                        desc=f"Processing {comp_label} samples",
-                    ):
-                        # Set attention mask for observer to filter padding tokens
-                        attention_mask = sample.get("attention_mask", None)
-                        observer.set_attention_mask(attention_mask)
-                        sample = {
-                            k: v.to(model.device) if torch.is_tensor(v) else v
-                            for k, v in sample.items()
-                        }
-                        model(**sample)
-                        observer.clear_attention_mask()
-                except Exception as e:
-                    logger.error(f"Error processing composite component '{comp_label}'")
-                    observer.save_state(cat_dir / "partial.pkl")
-                    logger.info(f"Partial results saved to {cat_dir / 'partial.pkl'}")
-                    raise e
-
-            logger.info(f"Finished component: {comp_label}")
-            # NOTE: No observer.reset() here — accumulate across components
-
-    # Save the combined observation
-    observer.save_state(f_name)
-    observer.close_hooks()
-    logger.info(f"Composite observation saved to {f_name}")
-
-    with open(f_name, "rb") as f:
-        observer_data = torch.load(f, weights_only=False)
-    return observer_data
-
-
 def record_activations(
     model, tokenizer, reap_args, model_args, ds_args, obs_args, results_dir
 ):
@@ -279,31 +184,55 @@ def record_activations(
 
     # check for composite dataset specification
     composite_components = parse_composite_dataset_spec(
-        ds_args.dataset_name, default_split=ds_args.split
+        ds_args.dataset_name,
+        default_split=ds_args.split,
     )
     if composite_components is not None:
-        return _record_activations_composite(
-            model,
-            tokenizer,
-            reap_args,
-            model_args,
-            ds_args,
-            obs_args,
-            results_dir,
-            composite_components,
+        combined_batches = []
+        total_samples = sum(c.num_samples for c in composite_components)
+        logger.info(
+            f"Loading composite dataset with {len(composite_components)} "
+            f"components, {total_samples} total samples."
         )
 
-    category_data_batches = load_category_batches(
-        dataset_name=ds_args.dataset_name, 
-        split=ds_args.split, 
-        tokenizer=tokenizer, 
-        model_max_length=obs_args.model_max_length,
-        split_by_category=obs_args.split_by_category,
-        return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
-        truncate=obs_args.truncate,
-        samples_per_category=obs_args.samples_per_category,
-        batch_size=obs_args.batch_size,
-    )
+        for comp_idx, component in enumerate(composite_components):
+            comp_label = (
+                f"{component.name}"
+                f"{f'[{component.subset}]' if component.subset is not None else ''}"
+                f"[{component.split}]"
+            )
+            logger.info(
+                f"[{comp_idx + 1}/{len(composite_components)}] Loading component: "
+                f"{comp_label} ({component.num_samples} samples)"
+            )
+            component_batches = load_category_batches(
+                dataset_name=component.name,
+                split=component.split,
+                subset=component.subset,
+                tokenizer=tokenizer,
+                model_max_length=obs_args.model_max_length,
+                split_by_category=False,
+                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+                truncate=obs_args.truncate,
+                samples_per_category=component.num_samples,
+                batch_size=obs_args.batch_size,
+            )
+            combined_batches.extend(component_batches["all"])
+
+        category_data_batches = {"all": combined_batches}
+    else:
+        category_data_batches = load_category_batches(
+            dataset_name=ds_args.dataset_name,
+            split=ds_args.split,
+            subset=ds_args.dataset_config_name,
+            tokenizer=tokenizer,
+            model_max_length=obs_args.model_max_length,
+            split_by_category=obs_args.split_by_category,
+            return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+            truncate=obs_args.truncate,
+            samples_per_category=obs_args.samples_per_category,
+            batch_size=obs_args.batch_size,
+        )
 
     logger.info(
         "Loaded and processed data for categories: %s",

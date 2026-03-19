@@ -12,6 +12,20 @@ model_name=${5:-"Qwen/Qwen3-30B-A3B"}
 dataset_name=${6:-"theblackcat102/evol-codealpaca-v1"}
 compression_ratio=${7:-0.50}
 
+artifact_dir_name() {
+    python - "$1" <<'PY'
+import hashlib
+import re
+import sys
+
+value = sys.argv[1]
+if "," in value:
+    print(f"composite_{hashlib.md5(value.encode()).hexdigest()[:8]}")
+else:
+    print(re.sub(r"[^\w\-_.]", "_", value.split("/")[-1]))
+PY
+}
+
 if [[ "${use_lora}" == "true" ]]; then
     server_log_file_name="sft-${method_description}-lora-r${lora_r}-a${lora_alpha}.log"
 else
@@ -44,8 +58,8 @@ if [[ "${method_description}" == "hc_smoe" ]]; then
         --do-eval false \
         --save-as-tied-params false
 
-    short_model_name=$(echo $model_name | cut -d'/' -f2)
-    short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
+    short_model_name=$(artifact_dir_name "$model_name")
+    short_dataset_name=$(artifact_dir_name "$dataset_name")
     model_dir="artifacts/${short_model_name}/${short_dataset_name}/merged_models/hc_smoe-${compression_ratio}/hc_smoe"
 elif [[ "${method_description}" == "m_smoe" ]]; then
     echo "Using M-SMoE"
@@ -67,8 +81,8 @@ elif [[ "${method_description}" == "m_smoe" ]]; then
         --cluster-description "m_smoe" \
         --do-eval false
 
-        short_model_name=$(echo $model_name | cut -d'/' -f2)
-        short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
+        short_model_name=$(artifact_dir_name "$model_name")
+        short_dataset_name=$(artifact_dir_name "$dataset_name")
         model_dir="artifacts/${short_model_name}/${short_dataset_name}/non_uniform_merged_models/m_smoe-${compression_ratio}/m_smoe"
 elif [[ "${method_description}" == "wmean" ]]; then
     echo "Using WMEAN"
@@ -82,8 +96,8 @@ elif [[ "${method_description}" == "wmean" ]]; then
         --server-log-file-name $server_log_file_name \
         --do-eval false \
         --distance_measure cosine
-    short_model_name=$(echo $model_name | cut -d'/' -f2)
-    short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
+    short_model_name=$(artifact_dir_name "$model_name")
+    short_dataset_name=$(artifact_dir_name "$dataset_name")
     model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruning_method}-${compression_ratio}"
 fi
 

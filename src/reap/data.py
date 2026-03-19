@@ -33,30 +33,62 @@ from vllm import TokensPrompt
 logger = logging.getLogger(__name__)
 
 
+def _maybe_json_load(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _normalize_message_content(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                else:
+                    parts.append(json.dumps(item, sort_keys=True))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
 @dataclass
 class CompositeDatasetComponent:
     """A single component of a composite dataset specification.
 
     Attributes:
         name: HuggingFace dataset name (e.g., "open-r1/Mixture-of-Thoughts").
-        split: HF dataset split to load (e.g., "code", "train"). None means use
+        split: HF dataset split to load (e.g., "train", "tool"). None means use
                the default split from DatasetArgs.
+        subset: HF dataset config/subset name (e.g., "code", "math"). None means
+                do not pass a subset to ``load_dataset``.
         num_samples: Number of samples to draw from this component.
     """
 
     name: str
     split: str | None
+    subset: str | None
     num_samples: int
 
 
-# Regex to parse a single component: <name>[<split>]:<num_samples>
+# Regex to parse a single component: <name>[<subset>](<split>):<num_samples>
 # Examples:
-#   "theblackcat102/evol-codealpaca-v1:4096"         -> name="theblackcat102/evol-codealpaca-v1", split=None, num_samples=4096
-#   "open-r1/Mixture-of-Thoughts[code]:4096"          -> name="open-r1/Mixture-of-Thoughts", split="code", num_samples=4096
-#   "SWE-bench/SWE-smith-trajectories:4096"           -> name="SWE-bench/SWE-smith-trajectories", split=None, num_samples=4096
+#   "theblackcat102/evol-codealpaca-v1:4096"            -> name="theblackcat102/evol-codealpaca-v1", subset=None, split=None, num_samples=4096
+#   "open-r1/Mixture-of-Thoughts[code]:4096"            -> name="open-r1/Mixture-of-Thoughts", subset="code", split=None, num_samples=4096
+#   "SWE-bench/SWE-smith-trajectories(tool):4096"      -> name="SWE-bench/SWE-smith-trajectories", subset=None, split="tool", num_samples=4096
+#   "dataset[subset](split):4096"                      -> name="dataset", subset="subset", split="split", num_samples=4096
 _COMPOSITE_COMPONENT_RE = re.compile(
-    r"^(?P<name>[^\[\]:,]+)"  # dataset name (no brackets, colons, commas)
-    r"(?:\[(?P<split>[^\]]+)\])?"  # optional [split]
+    r"^(?P<name>[^\[\]()[:,]+)"  # dataset name
+    r"(?:\[(?P<subset>[^\]]+)\])?"  # optional [subset]
+    r"(?:\((?P<split>[^\)]+)\))?"  # optional (split)
     r":(?P<num_samples>\d+)$"  # :num_samples (required for composite)
 )
 
@@ -64,6 +96,7 @@ _COMPOSITE_COMPONENT_RE = re.compile(
 def parse_composite_dataset_spec(
     spec: str,
     default_split: str = "train",
+    default_subset: str | None = None,
 ) -> list[CompositeDatasetComponent] | None:
     """Parse a composite dataset specification string.
 
@@ -71,11 +104,12 @@ def parse_composite_dataset_spec(
     (contains comma-separated entries with :num_samples), or None if the spec
     is a single dataset name (backward-compatible).
 
-    Format: ``name1[split1]:N1,name2:N2,name3[split3]:N3,...``
+    Format: ``name1[subset1](split1):N1,name2:N2,name3[subset3]:N3,...``
 
     Args:
         spec: The dataset specification string.
-        default_split: The default split to use when no [split] is specified.
+        default_split: The default split to use when no split is specified.
+        default_subset: The default subset to use when no subset is specified.
 
     Returns:
         List of parsed components, or None if this is a plain single-dataset name.
@@ -103,10 +137,13 @@ def parse_composite_dataset_spec(
                 return None
             raise ValueError(
                 f"Failed to parse composite dataset component {i}: '{part}'. "
-                f"Expected format: <dataset_name>[<split>]:<num_samples>. "
+                f"Expected format: <dataset_name>[<subset>](<split>):<num_samples>. "
                 f"Full spec: '{spec}'"
             )
         name = m.group("name").strip()
+        subset = m.group("subset")
+        if subset is None:
+            subset = default_subset
         split = m.group("split")
         if split is None:
             split = default_split
@@ -115,6 +152,7 @@ def parse_composite_dataset_spec(
             CompositeDatasetComponent(
                 name=name,
                 split=split,
+                subset=subset,
                 num_samples=num_samples,
             )
         )
@@ -124,12 +162,18 @@ def parse_composite_dataset_spec(
 
     logger.info(
         f"Parsed composite dataset spec with {len(components)} components: "
-        + ", ".join(f"{c.name}[{c.split}]:{c.num_samples}" for c in components)
+        + ", ".join(
+            f"{c.name}"
+            f"{f'[{c.subset}]' if c.subset is not None else ''}"
+            f"{f'({c.split})' if c.split is not None else ''}"
+            f":{c.num_samples}"
+            for c in components
+        )
     )
     return components
 
 
-def _load_raw_dataset(dataset_name, split):
+def _load_raw_dataset(dataset_name, split, subset=None):
     """Load a raw HuggingFace dataset, handling special cases like C4."""
     try:
         if dataset_name == "allenai/c4":
@@ -138,17 +182,21 @@ def _load_raw_dataset(dataset_name, split):
                 "json", data_files={"train": file_url}, split="train", streaming=False
             )
         else:
-            return load_dataset(dataset_name, split=split)
+            load_kwargs = {}
+            if subset is not None:
+                load_kwargs = {"name": subset}
+            return load_dataset(dataset_name, split=split, **load_kwargs)
     except Exception as e:
         raise RuntimeError(
-            f"Failed to load dataset '{dataset_name}' (split={split}): {e}"
+            f"Failed to load dataset '{dataset_name}' (subset={subset}, split={split}): {e}"
         )
 
 
 def load_category_batches(
-    dataset_name, 
-    split, 
-    tokenizer, 
+    dataset_name,
+    split,
+    subset,
+    tokenizer,
     model_max_length,
     batch_size,
     split_by_category,
@@ -156,7 +204,7 @@ def load_category_batches(
     truncate,
     samples_per_category,
 ):
-    raw_ds = _load_raw_dataset(dataset_name, split)
+    raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
     # load dataset processor
     proc_cls = DATASET_REGISTRY.get(dataset_name)
@@ -175,7 +223,7 @@ def load_category_batches(
         split_by_category=split_by_category,
         return_vllm_tokens_prompt=return_vllm_tokens_prompt,
         truncate=truncate,
-        batch_size=batch_size,        
+        batch_size=batch_size,
     )
     category_data_batches = processor.get_processed_dataset(
         samples_per_category=samples_per_category,
@@ -430,7 +478,9 @@ class BaseDatasetProcessor(ABC):
                 )
                 processed_samples.append(encoded_sample)
             else:
-                current_batch.append({"input_ids": encoded_sample, "attention_mask": attention_mask})
+                current_batch.append(
+                    {"input_ids": encoded_sample, "attention_mask": attention_mask}
+                )
                 if len(current_batch) >= self.batch_size:
                     batched = self._collate_batch(current_batch)
                     processed_samples.append(batched)
@@ -488,7 +538,9 @@ class BaseDatasetProcessor(ABC):
                 )
                 processed_samples.append(encoded_sample)
             else:
-                current_batch.append({"input_ids": seq, "attention_mask": attention_mask})
+                current_batch.append(
+                    {"input_ids": seq, "attention_mask": attention_mask}
+                )
                 if len(current_batch) >= self.batch_size:
                     batched = self._collate_batch(current_batch)
                     processed_samples.append(batched)
@@ -506,7 +558,7 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
     def _encode_sample(self, sample: dict) -> torch.Tensor:
         chat_template_kwargs = {}
         if self.tools_field in sample:
-            chat_template_kwargs = {"tools": sample[self.tools_field]}
+            chat_template_kwargs = {"tools": _maybe_json_load(sample[self.tools_field])}
         chat_sample = self.tokenizer.apply_chat_template(
             sample[self.messages_field],
             add_generation_prompt=False,
@@ -525,10 +577,16 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
 
         def chat_template_fn(sample: dict[str, any]) -> dict[str, any]:
             """Apply chat template to the sample."""
+            chat_template_kwargs = {}
+            if self.tools_field in sample:
+                chat_template_kwargs = {
+                    "tools": _maybe_json_load(sample[self.tools_field])
+                }
             chat_sample = self.tokenizer.apply_chat_template(
                 sample[self.messages_field],
                 add_generation_prompt=False,
                 tokenize=False,
+                **chat_template_kwargs,
             )
             return {"text": chat_sample}
 
@@ -682,7 +740,9 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
     @staticmethod
     def _map_fn(sample: dict[str, any]) -> dict[str, any]:
         tool_calls = []
-        for tool_call in sample["answers"]:
+        gt_tool_calls = _maybe_json_load(sample["answers"])
+
+        for tool_call in gt_tool_calls:
             tool_calls.append(
                 {
                     "function": {
@@ -703,7 +763,11 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
                     "tool_calls": tool_calls,
                 },
             ],
-            "tools": sample["tools"],
+            "tools": (
+                sample["tools"]
+                if isinstance(sample["tools"], str)
+                else json.dumps(sample["tools"])
+            ),
         }
 
 
@@ -834,12 +898,13 @@ class SWESmithTrajectoriesDataset(ChatDatasetProcessor):
     @staticmethod
     def _map_fn(sample: dict[str, any]) -> dict[str, any]:
         formatted_messages = []
-        for message in sample["messages"]:
+        gt_messages = _maybe_json_load(sample["messages"])
+        for message in gt_messages:
             formatted_message = {
                 "role": message["role"],
-                "content": message["content"],
+                "content": _normalize_message_content(message.get("content")),
             }
-            if message["tool_calls"] is not None:
+            if "tool_calls" in message and message["tool_calls"] is not None:
                 formatted_message["tool_calls"] = []
                 for tool_call in message["tool_calls"]:
                     formatted_message["tool_calls"].append(

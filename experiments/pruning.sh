@@ -6,6 +6,20 @@ port=$((8000 + FIRST_DEVICE))
 model_name=${2:-"Qwen/Qwen3-30B-A3B"}
 seed=${3:-42}
 
+artifact_dir_name() {
+    python - "$1" <<'PY'
+import hashlib
+import re
+import sys
+
+value = sys.argv[1]
+if "," in value:
+    print(f"composite_{hashlib.md5(value.encode()).hexdigest()[:8]}")
+else:
+    print(re.sub(r"[^\w\-_.]", "_", value.split("/")[-1]))
+PY
+}
+
 server_log_file_name="pruning-${FIRST_DEVICE}-seed_${seed}.log"
 run_lm_eval=true
 run_evalplus=true
@@ -52,8 +66,8 @@ for dataset_name in "${datasets[@]}"; do
                 --seed $seed \
                 --output_file_name ${output_file_name}
 
-            short_model_name=$(echo $model_name | cut -d'/' -f2)
-            short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
+            short_model_name=$(artifact_dir_name "$model_name")
+            short_dataset_name=$(artifact_dir_name "$dataset_name")
             model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruning_method}-seed_${seed}-${compression_ratio}"
             echo "evaluating model: ${model_dir}"
             bash eval.sh \
