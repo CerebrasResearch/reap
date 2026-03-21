@@ -17,12 +17,10 @@ Usage:
         --dataset_name "theblackcat102/evol-codealpaca-v1" \
         --prune_method "reap" \
         --compression_ratio 0.5 \
-        --use_layerwise True \
         --batch_size 4
 """
 
 from __future__ import annotations
-import time
 import logging
 import dataclasses
 import pathlib
@@ -31,7 +29,6 @@ from typing import Any, Dict, List
 import yaml
 
 import torch
-from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 
 from accelerate.utils import set_seed
@@ -47,16 +44,12 @@ from reap.args import (
     LayerwiseArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.model_util import (
-    get_moe,
-    MODEL_ATTRS,
-    patched_model_map,
-    get_super_expert_indices,
-)
+from reap.model_util import patched_model_map
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver, LayerwiseMoEObserverConfig
 from reap.layerwise_model_utils import cleanup_memory
 from reap.eval import run_evaluate
+from reap.prune import prune as prune_model
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -126,6 +119,9 @@ def prepare_calibration_batches(
         all_batches = []
         total_samples = sum(component.num_samples for component in composite_components)
         logger.info(
+            f"Composite dataset specified, overwriting given samples_per_category={obs_args.samples_per_category}"
+        )
+        logger.info(
             f"Preparing composite calibration data with {len(composite_components)} "
             f"components, {total_samples} total samples."
         )
@@ -138,6 +134,7 @@ def prepare_calibration_batches(
             category_data_batches = load_category_batches(
                 dataset_name=component.name,
                 split=component.split,
+                subset=component.subset,
                 tokenizer=tokenizer,
                 model_max_length=obs_args.model_max_length,
                 split_by_category=False,
@@ -156,6 +153,7 @@ def prepare_calibration_batches(
     category_data_batches = load_category_batches(
         dataset_name=ds_args.dataset_name,
         split=ds_args.split,
+        subset=ds_args.dataset_config_name,
         tokenizer=tokenizer,
         model_max_length=obs_args.model_max_length,
         split_by_category=obs_args.split_by_category,
@@ -212,8 +210,6 @@ def record_activations_layerwise(
         fused_experts=base_config.fused_experts,
         renormalize_router_weights=obs_args.renormalize_router_weights,
         record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
-        online_reduction=True,
-        aggressive_cleanup=layerwise_args.aggressive_cleanup,
     )
     layerwise_config.module_class_name_to_hook_regex = (
         base_config.module_class_name_to_hook_regex
@@ -253,138 +249,6 @@ def record_activations_layerwise(
     logger.info(f"Layerwise activation recording complete. Saved to {output_file}")
 
     return observer_data
-
-
-def prune(
-    observer_data: Dict[int, Dict[str, Any]],
-    model,
-    prune_args: PruneArgs,
-    n_experts_to_prune: int,
-    pruned_model_dir: pathlib.Path,
-):
-    """
-    Prune the model based on the observer data.
-
-    This is adapted from the standard prune.py but works with
-    layerwise-collected observer data.
-    """
-    model_attrs = MODEL_ATTRS[model.__class__.__name__]
-
-    # Calculate expert probabilities
-    for layer in observer_data:
-        if "expert_proba" not in observer_data[layer]:
-            observer_data[layer]["expert_proba"] = (
-                observer_data[layer]["expert_frequency"]
-                / observer_data[layer]["total_tokens"]
-            )
-
-    # Handle super expert preservation
-    if prune_args.perserve_super_experts or prune_args.perserve_outliers:
-        super_expert_idx = get_super_expert_indices(
-            observer_data, include_last_layers=prune_args.perserve_outliers
-        )
-        metrics = [
-            "expert_proba",
-            "ean_sum",
-            "ean_mean",
-            "weighted_expert_frequency_sum",
-            "weighted_ean_sum",
-            "reap",
-        ]
-        for layer in observer_data:
-            super_experts_in_layer = super_expert_idx[super_expert_idx[:, 0] == layer][
-                :, 1
-            ]
-            if len(super_experts_in_layer) > 0:
-                for metric in metrics:
-                    if metric in observer_data[layer]:
-                        observer_data[layer][metric][super_experts_in_layer] = float(
-                            "inf"
-                        )
-
-    # Prune each layer
-    for layer in tqdm(observer_data, "Pruning layers..."):
-        num_experts = observer_data[layer]["expert_frequency"].shape[0]
-
-        # Get saliency scores
-        prune_method = prune_args.prune_method
-        if prune_method == "frequency":
-            prune_method = "expert_frequency"
-
-        saliency_data = observer_data[layer].get(prune_method)
-        if saliency_data is None:
-            raise ValueError(
-                f"Prune method {prune_args.prune_method} not found in observer data "
-                f"for layer {layer}. Available: {list(observer_data[layer].keys())}"
-            )
-
-        # Get experts to prune (lowest saliency)
-        _, experts_to_prune = torch.topk(
-            saliency_data, n_experts_to_prune, largest=False
-        )
-
-        retained_expert_indices = [
-            i for i in range(num_experts) if i not in experts_to_prune
-        ]
-
-        # Prune experts in the MoE module
-        moe = get_moe(model, layer)
-
-        if not model_attrs["fused"]:
-            # Non-fused experts (loop-based)
-            all_experts = getattr(moe, model_attrs["experts"])
-            retained_experts = [all_experts[i] for i in retained_expert_indices]
-            retained_experts = torch.nn.ModuleList(retained_experts)
-            setattr(moe, model_attrs["experts"], retained_experts)
-
-            # Handle model-specific quirks
-            if model.__class__.__name__.lower() == "ernie4_5_moeForCausalLM".lower():
-                moe.moe_statics.e_score_correction_bias.data = (
-                    moe.moe_statics.e_score_correction_bias.data[
-                        :, retained_expert_indices
-                    ]
-                )
-
-            # Prune router
-            router = getattr(moe, model_attrs["router"])
-            router.weight.data = router.weight.data[retained_expert_indices, :]
-            if getattr(router, "bias", None):
-                router.bias.data = router.bias.data[retained_expert_indices]
-            router.out_features = len(retained_expert_indices)
-
-            if hasattr(router, "e_score_correction_bias"):
-                router.e_score_correction_bias.data = (
-                    router.e_score_correction_bias.data[retained_expert_indices]
-                )
-            setattr(moe, model_attrs["router"], router)
-        else:
-            # Fused experts (e.g., Llama-4)
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indices
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indices]
-            moe.num_experts = len(retained_expert_indices)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indices]
-            moe.router.out_features = len(retained_expert_indices)
-            if hasattr(moe.router, "num_experts"):
-                moe.router.num_experts = len(retained_expert_indices)
-
-    # Update config
-    logger.info("Saving pruned model...")
-    retained_experts = len(retained_expert_indices)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
-
-    if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":
-        model.config.moe_capacity = [retained_experts] * 3
-
-    # Save model
-    pruned_model_dir.mkdir(parents=True, exist_ok=True)
-    start = time.time()
-    model.save_pretrained(pruned_model_dir)
-    end = time.time()
-    logger.info(f"Pruned model saved to {pruned_model_dir} in {end - start:.2f}s")
-
-    return pruned_model_dir
 
 
 def get_pruned_model_dir(
@@ -595,7 +459,7 @@ def main():
 
         # Prune
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
-        prune(
+        prune_model(
             observer_data,
             model,
             prune_args,

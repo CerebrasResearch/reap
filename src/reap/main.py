@@ -191,6 +191,9 @@ def record_activations(
         combined_batches = []
         total_samples = sum(c.num_samples for c in composite_components)
         logger.info(
+            f"Composite dataset specified, overwriting given samples_per_category={obs_args.samples_per_category}"
+        )
+        logger.info(
             f"Loading composite dataset with {len(composite_components)} "
             f"components, {total_samples} total samples."
         )

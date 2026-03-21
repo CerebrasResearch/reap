@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import gc
+import inspect
 import logging
 import pathlib
 
@@ -26,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from transformers.tokenization_utils_base import BatchEncoding
 
 from reap.metrics import OnlineStatsTracker
 from reap.observer import (
@@ -48,9 +50,6 @@ logger = logging.getLogger(__name__)
 class LayerwiseMoEObserverConfig(MoETransformerObserverConfig):
     """Configuration for layerwise MoE observer."""
 
-    online_reduction: bool = True
-    aggressive_cleanup: bool = True
-
 
 class LayerwiseMoEObserver:
     """
@@ -70,6 +69,17 @@ class LayerwiseMoEObserver:
     - weighted_expert_frequency_sum: Sum of router weights per expert
     - max_activations: Maximum activation magnitude per expert
     """
+
+    _REPLAY_KWARG_ALLOWLIST = {"cache_position", "position_embeddings"}
+    _REPLAY_KWARG_DROP_KEYS = {"past_key_value", "past_key_values"}
+    _REPLAY_KWARG_FORCED_VALUES = {
+        "use_cache": False,
+        "output_attentions": False,
+        "output_hidden_states": False,
+        "return_dict": False,
+        "output_router_loss": False,
+        "output_gate_logits": False,
+    }
 
     def __init__(
         self,
@@ -113,6 +123,9 @@ class LayerwiseMoEObserver:
 
         # MoE module cache per block
         self._moe_modules_cache: Dict[int, nn.Module] = {}
+
+        # Forward signature cache per block
+        self._forward_signature_cache: Dict[int, Tuple[set[str], bool]] = {}
 
         logger.info(
             f"LayerwiseMoEObserver initialized with {len(self.block_names)} blocks"
@@ -246,10 +259,10 @@ class LayerwiseMoEObserver:
         except Exception:
             return False
 
-    def _load_specific_block(self, block_idx: int):
+    def _load_specific_block(self, block_idx: int) -> str:
         """Load only the specified transformer block, unloading others."""
         if self.currently_loaded_block_idx == block_idx:
-            return
+            return self._safe_get_device(self.layers[block_idx])
 
         # Unload current block if any
         if self.currently_loaded_block_idx >= 0:
@@ -273,8 +286,14 @@ class LayerwiseMoEObserver:
             except Exception as e:
                 logger.warning(f"Could not check/move block {block_idx}: {e}")
 
+            final_device = self._safe_get_device(target_layer)
+        else:
+            final_device = "meta"
+
         self.currently_loaded_block_idx = block_idx
         logger.debug(f"Loaded block {block_idx}")
+
+        return final_device
 
     def _unload_current_block(self):
         """Unload the currently loaded block to free memory."""
@@ -381,6 +400,9 @@ class LayerwiseMoEObserver:
                     layer_kwargs[k] = LayerwiseMoEObserver._move_to_device(
                         v, cpu_device
                     )
+            layer_kwargs = LayerwiseMoEObserver._sanitize_cached_layer_kwargs(
+                layer_kwargs
+            )
             self.layer_kwargs_cache.append(layer_kwargs)
 
             raise ValueError("Input captured")
@@ -393,7 +415,7 @@ class LayerwiseMoEObserver:
             for batch in tqdm(data_batches, desc="Capturing layer inputs"):
                 if isinstance(batch, torch.Tensor):
                     batch_dict = {"input_ids": batch.to(device)}
-                elif isinstance(batch, dict):
+                elif isinstance(batch, dict) or isinstance(batch, BatchEncoding):
                     batch_dict = {}
                     for k, v in batch.items():
                         if torch.is_tensor(v):
@@ -430,12 +452,66 @@ class LayerwiseMoEObserver:
         """Recursively move tensors within nested structures to target device."""
         if torch.is_tensor(value) and str(value.device) != "meta":
             return value.to(target_device)
+        elif isinstance(value, dict):
+            return {
+                k: LayerwiseMoEObserver._move_to_device(v, target_device)
+                for k, v in value.items()
+            }
         elif isinstance(value, (tuple, list)):
             moved = [
                 LayerwiseMoEObserver._move_to_device(v, target_device) for v in value
             ]
             return type(value)(moved)
         return value
+
+    @classmethod
+    def _sanitize_cached_layer_kwargs(cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only replay-safe kwargs captured from the original forward."""
+        sanitized = {}
+        for key, value in kwargs.items():
+            if key in cls._REPLAY_KWARG_DROP_KEYS:
+                continue
+            if key in cls._REPLAY_KWARG_ALLOWLIST:
+                sanitized[key] = value
+        return sanitized
+
+    def _get_forward_signature_info(self, block_idx: int) -> Tuple[set[str], bool]:
+        """Return accepted forward kwargs and whether the block accepts **kwargs."""
+        cached = self._forward_signature_cache.get(block_idx)
+        if cached is not None:
+            return cached
+
+        signature = inspect.signature(self.layers[block_idx].forward)
+        accepted_kwargs = set()
+        accepts_var_kwargs = False
+        for name, parameter in signature.parameters.items():
+            if name == "self":
+                continue
+            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                accepts_var_kwargs = True
+            elif parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                accepted_kwargs.add(name)
+
+        info = (accepted_kwargs, accepts_var_kwargs)
+        self._forward_signature_cache[block_idx] = info
+        return info
+
+    def _build_replay_kwargs(self, block_idx: int, layer_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Build minimal kwargs for replaying a decoder block without caches."""
+        replay_kwargs = self._sanitize_cached_layer_kwargs(layer_kwargs)
+        accepted_kwargs, accepts_var_kwargs = self._get_forward_signature_info(block_idx)
+
+        for key, value in self._REPLAY_KWARG_FORCED_VALUES.items():
+            if accepts_var_kwargs or key in accepted_kwargs:
+                replay_kwargs[key] = value
+
+        if accepts_var_kwargs:
+            return replay_kwargs
+
+        return {key: value for key, value in replay_kwargs.items() if key in accepted_kwargs}
 
     def _prepare_block_inputs(
         self, batch_idx: int, target_device: torch.device
@@ -527,10 +603,15 @@ class LayerwiseMoEObserver:
             # Handle different attention mask shapes
             if attention_mask.dim() == 4:
                 # Shape: [batch_size, 1, seq_len, seq_len] - HuggingFace 4D causal mask
-                # Convention: 0.0 = valid/attend, large negative = masked/padding.
-                # Use the last row of each batch's mask (most permissive view)
-                # and invert: positions with value 0.0 are valid.
-                valid_token_mask = attention_mask[:, 0, -1, :] == 0
+                # Use the last row of each batch's mask to infer which token
+                # positions are valid for the full sequence. Some models pass
+                # a boolean mask (True = valid), others an additive mask
+                # (0 = valid, large negative = masked).
+                mask_row = attention_mask[:, 0, -1, :]
+                if mask_row.dtype == torch.bool:
+                    valid_token_mask = mask_row
+                else:
+                    valid_token_mask = mask_row == 0
             elif attention_mask.dim() == 2:
                 # Shape: [batch_size, seq_len] - standard padding mask
                 # Convention: 1 = valid, 0 = padding.
@@ -542,7 +623,7 @@ class LayerwiseMoEObserver:
 
             if valid_token_mask is not None:
                 # Flatten to [batch_size * seq_len]
-                valid_token_mask = valid_token_mask.view(-1)
+                valid_token_mask = valid_token_mask.reshape(-1)
 
         # Initialize state for this layer if needed
         if block_idx not in self.state:
@@ -728,20 +809,11 @@ class LayerwiseMoEObserver:
         if not self.layers or block_idx >= len(self.layers):
             raise ValueError(f"Block {block_idx} not found")
 
-        self._load_specific_block(block_idx)
-
+        device_str = self._load_specific_block(block_idx)
         layer = self.layers[block_idx]
-        device_str = self._safe_get_device(layer)
 
         if device_str == "meta":
             device_str = "cuda" if torch.cuda.is_available() else "cpu"
-        elif device_str == "cpu" and torch.cuda.is_available():
-            try:
-                layer.to("cuda")
-                device_str = "cuda"
-            except Exception as e:
-                logger.warning(f"Failed to move block {block_idx} to GPU: {e}")
-
         target_device = torch.device(device_str)
 
         # Find MoE module in this block
@@ -771,6 +843,9 @@ class LayerwiseMoEObserver:
                 layer_input, layer_kwargs = self._prepare_block_inputs(
                     batch_idx, target_device
                 )
+                attention_mask = layer_kwargs.get("attention_mask", None)
+
+                layer_kwargs = self._build_replay_kwargs(block_idx, layer_kwargs)
                 captured_moe_input.clear()
 
                 with torch.amp.autocast(device_type="cuda", enabled=False):
@@ -781,12 +856,10 @@ class LayerwiseMoEObserver:
                 else:
                     hidden_states = outputs
 
-                moe_input = captured_moe_input.get(
+                moe_input = captured_moe_input.pop(
                     "input",
                     layer_input[0] if layer_input else hidden_states,
                 )
-
-                attention_mask = layer_kwargs.get("attention_mask", None)
 
                 self._process_moe_activations(
                     block_idx,
@@ -796,7 +869,10 @@ class LayerwiseMoEObserver:
                     attention_mask=attention_mask,
                 )
 
-                layer_outputs.append([hidden_states.cpu()])
+                layer_outputs.append([hidden_states.detach().cpu()])
+
+                del outputs, hidden_states, moe_input, layer_input, layer_kwargs
+                captured_moe_input.clear()
 
                 if batch_idx % 4 == 0:
                     cleanup_memory(synchronize=False)
