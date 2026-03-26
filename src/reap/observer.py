@@ -1,5 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Any, Optional
 import gc
 from functools import reduce
@@ -231,17 +232,24 @@ class MoETransformerObserver(BaseTransformerObserver):
         self._current_attention_mask: Optional[torch.Tensor] = None
         super().__init__(model, hook_config)
 
+    @contextmanager
     def set_attention_mask(self, attention_mask: Optional[torch.Tensor]):
-        """Set the attention mask for the current forward pass.
+        """Temporarily set the attention mask for the current forward pass.
 
-        This must be called before each forward pass when using batched inputs
-        with padding, to ensure padding tokens are excluded from statistics.
+        Use this as a context manager around each forward pass when using
+        batched inputs with padding, to ensure padding tokens are excluded
+        from statistics.
 
         Args:
             attention_mask: Tensor of shape (batch_size, seq_len) with 1 for real
                 tokens and 0 for padding tokens. Can be None for unbatched inputs.
         """
+        previous_attention_mask = self._current_attention_mask
         self._current_attention_mask = attention_mask
+        try:
+            yield
+        finally:
+            self._current_attention_mask = previous_attention_mask
 
     def clear_attention_mask(self):
         """Clear the attention mask after forward pass."""

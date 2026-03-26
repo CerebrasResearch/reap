@@ -261,13 +261,12 @@ def record_activations(
                 logger.info("No previous data found @ %s", f_name)
                 for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
                     attention_mask = sample.get("attention_mask", None)
-                    observer.set_attention_mask(attention_mask)
                     sample = {
                         k: v.to(model.device) if torch.is_tensor(v) else v
                         for k, v in sample.items()
                     }
-                    model(**sample)
-                    observer.clear_attention_mask()
+                    with observer.set_attention_mask(attention_mask):
+                        model(**sample)
             except Exception as e:
                 logger.error(f"Error processing category '{category}'")
                 logger.info(
@@ -518,13 +517,13 @@ def save_merged_model(
     logger.info("Saving merged model...")
     merged_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
+
     try:
         model.save_pretrained(merged_model_dir, safe_serialization=safe_serialization)
         tokenizer.save_pretrained(merged_model_dir)
     except Exception as e:
-        import pdb
+        raise e
 
-        breakpoint()
     end = time.time()
     logger.info(
         f"Merged model saved to {merged_model_dir} in {end - start:.2f} seconds"
