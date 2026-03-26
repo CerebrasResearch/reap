@@ -580,7 +580,7 @@ class LayerwiseArgs:
         },
     )
 
-
+    
 @dataclass
 class QuantizationArgs:
     quantization_method: str = field(
