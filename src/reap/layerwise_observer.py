@@ -32,7 +32,6 @@ from transformers.tokenization_utils_base import BatchEncoding
 from reap.metrics import OnlineStatsTracker
 from reap.observer import (
     MoETransformerObserverConfig,
-    OBSERVER_CONFIG_REGISTRY,
 )
 from reap.layerwise_model_utils import (
     extract_model_components,
@@ -63,14 +62,13 @@ class LayerwiseMoEObserver:
     - expert_frequency: How often each expert is selected
     - pairwise_expert_frequency: Co-occurrence counts
     - ean_sum: Sum of L2 norms of expert outputs (for routed tokens)
-    - ean_mean: Mean of L2 norms (online tracker)
+    - ean_mean: Mean of L2 norms
     - weighted_ean_sum: Router-weighted EAN
     - reap: Mean of (router_weight * activation_norm)
     - weighted_expert_frequency_sum: Sum of router weights per expert
     - max_activations: Maximum activation magnitude per expert
     """
 
-    _REPLAY_KWARG_ALLOWLIST = {"cache_position", "position_embeddings"}
     _REPLAY_KWARG_DROP_KEYS = {"past_key_value", "past_key_values"}
     _REPLAY_KWARG_FORCED_VALUES = {
         "use_cache": False,
@@ -436,9 +434,8 @@ class LayerwiseMoEObserver:
                         continue
                     else:
                         raise
-                except Exception as e:
-                    logger.warning(f"Unexpected error during input capture: {e}")
-                    continue
+                except Exception:
+                    raise
         finally:
             handle.remove()
 
@@ -466,13 +463,12 @@ class LayerwiseMoEObserver:
 
     @classmethod
     def _sanitize_cached_layer_kwargs(cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Keep only replay-safe kwargs captured from the original forward."""
+        """Drop cache kwargs that cannot be replayed safely."""
         sanitized = {}
         for key, value in kwargs.items():
             if key in cls._REPLAY_KWARG_DROP_KEYS:
                 continue
-            if key in cls._REPLAY_KWARG_ALLOWLIST:
-                sanitized[key] = value
+            sanitized[key] = value
         return sanitized
 
     def _get_forward_signature_info(self, block_idx: int) -> Tuple[set[str], bool]:
@@ -500,7 +496,7 @@ class LayerwiseMoEObserver:
         return info
 
     def _build_replay_kwargs(self, block_idx: int, layer_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Build minimal kwargs for replaying a decoder block without caches."""
+        """Build kwargs for replaying a decoder block without cache state."""
         replay_kwargs = self._sanitize_cached_layer_kwargs(layer_kwargs)
         accepted_kwargs, accepts_var_kwargs = self._get_forward_signature_info(block_idx)
 
@@ -818,19 +814,19 @@ class LayerwiseMoEObserver:
 
         # Find MoE module in this block
         moe_module = self._find_moe_module_in_block(block_idx)
-        if moe_module is None:
-            logger.warning(f"No MoE module found in block {block_idx}, skipping")
-            return {}
-
-        # Register a forward hook on the MoE module to capture its actual input
-        # (post-attention hidden states), rather than using the block input as a proxy.
         captured_moe_input: Dict[str, torch.Tensor] = {}
 
-        def _capture_moe_input_hook(module, args, output):
-            captured_moe_input["input"] = args[0].detach()
-            return output
+        if moe_module is None:
+            logger.warning(
+                f"No MoE module found in block {block_idx}; continuing without MoE metrics"
+            )
+        else:
+            # Register a forward hook on the MoE module to capture its input
+            def _capture_moe_input_hook(module, args, output):
+                captured_moe_input["input"] = args[0].detach()
+                return output
 
-        moe_hook_handle = moe_module.register_forward_hook(_capture_moe_input_hook)
+            moe_hook_handle = moe_module.register_forward_hook(_capture_moe_input_hook)
 
         try:
             if not self.layer_inputs_cache:
@@ -856,22 +852,22 @@ class LayerwiseMoEObserver:
                 else:
                     hidden_states = outputs
 
-                moe_input = captured_moe_input.pop(
-                    "input",
-                    layer_input[0] if layer_input else hidden_states,
-                )
-
-                self._process_moe_activations(
-                    block_idx,
-                    moe_module,
-                    moe_input,
-                    target_device,
-                    attention_mask=attention_mask,
-                )
+                if moe_module is not None:
+                    moe_input = captured_moe_input["input"]
+                    
+                    self._process_moe_activations(
+                        block_idx,
+                        moe_module,
+                        moe_input,
+                        target_device,
+                        attention_mask=attention_mask,
+                    )
 
                 layer_outputs.append([hidden_states.detach().cpu()])
 
-                del outputs, hidden_states, moe_input, layer_input, layer_kwargs
+                del outputs, hidden_states, layer_input, layer_kwargs
+                if moe_module is not None:
+                    del moe_input
                 captured_moe_input.clear()
 
                 if batch_idx % 4 == 0:
@@ -887,7 +883,8 @@ class LayerwiseMoEObserver:
             return self.state.get(block_idx, {})
 
         finally:
-            moe_hook_handle.remove()
+            if moe_hook_handle is not None:
+                moe_hook_handle.remove()
             self._unload_current_block()
 
     @torch.inference_mode()
@@ -989,20 +986,10 @@ class LayerwiseMoEObserver:
         self._clear_cache()
         logger.debug("Observer state reset")
 
-    def close(self):
+    def close_hooks(self):
         """Clean up resources."""
         self.reset()
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
         logger.debug("Observer closed")
-
-
-# Registry for layerwise observer configs
-LAYERWISE_OBSERVER_CONFIG_REGISTRY = {
-    model_name: lambda **kwargs: LayerwiseMoEObserverConfig(
-        **{k: v for k, v in OBSERVER_CONFIG_REGISTRY[model_name]().__dict__.items()},
-        **kwargs,
-    )
-    for model_name in OBSERVER_CONFIG_REGISTRY
-}

@@ -66,6 +66,7 @@ def test_layerwise_observer_matches_standard_observer_for_batched_input():
         hook_config=_make_layerwise_config(),
     )
     layerwise_state = layerwise_observer.collect_all_blocks([batch])
+    layerwise_observer.close_hooks()
 
     expected_tokens = batch["attention_mask"].sum()
     assert layerwise_state[0]["total_tokens"] == expected_tokens
