@@ -58,7 +58,7 @@ python -m reap.layerwise_prune \
     --do-eval false \
     --seed $seed \
     --output_file_name ${output_file_name} \
-    --samples_per_category ${num_samples} \
+    --batches_per_category ${num_samples} \
     --batch_size ${batch_size} \
     --low_cpu_mem_usage True
 

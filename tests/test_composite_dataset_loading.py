@@ -23,7 +23,7 @@ def test_composite_dataset_loading_with_real_hf_datasets():
     )
     assert composite_components is not None
     assert [
-        (component.name, component.subset, component.split, component.num_samples)
+        (component.name, component.subset, component.split, component.num_batches)
         for component in composite_components
     ] == [
         ("theblackcat102/evol-codealpaca-v1", None, "train", 8),
@@ -45,7 +45,7 @@ def test_composite_dataset_loading_with_real_hf_datasets():
             split_by_category=False,
             return_vllm_tokens_prompt=False,
             truncate=True,
-            samples_per_category=1,
+            batches_per_category=1,
             batch_size=2,
         )
 

@@ -99,7 +99,7 @@ class DatasetArgs:
 
 @dataclass
 class ObserverArgs:
-    samples_per_category: int = 1024
+    batches_per_category: int = 1024
     split_by_category: bool = False
     select_only_categories: list[str] | str | None = field(
         default=None,

@@ -34,7 +34,8 @@ run_math=${10:-false}
 run_wildbench=${11:-false}
 singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
-num_samples=1024
+# batch size is 1 by default
+num_batches=1024
 output_file_name="observations_${num_samples}_cosine-seed_${seed}.pt"
 
 
@@ -60,7 +61,7 @@ python src/reap/prune.py \
     --output_file_name ${output_file_name} \
     --singleton_super_experts ${singleton_super_experts} \
     --singleton_outlier_experts ${singleton_outlier_experts} \
-    --samples_per_category ${num_samples} \
+    --batches_per_category ${num_batches} \
     --record_pruning_metrics_only true
 
 short_model_name=$(artifact_dir_name "$model_name")

@@ -117,9 +117,10 @@ def prepare_calibration_batches(
 
     if composite_components is not None:
         all_batches = []
-        total_samples = sum(component.num_samples for component in composite_components)
+        total_samples = sum(component.num_batches for component in composite_components)
         logger.info(
-            f"Composite dataset specified, overwriting given samples_per_category={obs_args.samples_per_category}"
+            f"Composite dataset specified, overwriting given batches_per_category={obs_args.batches_per_category} "
+            f"with values in composite dataset spec."
         )
         logger.info(
             f"Preparing composite calibration data with {len(composite_components)} "
@@ -129,7 +130,7 @@ def prepare_calibration_batches(
         for component in composite_components:
             comp_label = f"{component.name}[{component.split}]"
             logger.info(
-                f"Loading composite component {comp_label} ({component.num_samples} samples)"
+                f"Loading composite component {comp_label} ({component.num_batches} batches)"
             )
             category_data_batches = load_category_batches(
                 dataset_name=component.name,
@@ -140,7 +141,7 @@ def prepare_calibration_batches(
                 split_by_category=False,
                 return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
                 truncate=obs_args.truncate,
-                samples_per_category=component.num_samples,
+                batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
             )
             for category, batches in category_data_batches.items():
@@ -159,7 +160,7 @@ def prepare_calibration_batches(
         split_by_category=obs_args.split_by_category,
         return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
         truncate=obs_args.truncate,
-        samples_per_category=obs_args.samples_per_category,
+        batches_per_category=obs_args.batches_per_category,
         batch_size=obs_args.batch_size,
     )
 
