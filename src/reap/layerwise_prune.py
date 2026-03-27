@@ -236,6 +236,7 @@ def record_activations_layerwise(
     observer_data = observer.collect_all_blocks(
         data_batches=data_batches,
         save_path=save_path,
+        batch_group_size=layerwise_args.batch_group_size,
     )
 
     # Save complete state
@@ -336,6 +337,11 @@ def main():
         raise ValueError(
             "Only one of perserve_super_experts or perserve_outliers can be True."
         )
+    if (
+        layerwise_args.batch_group_size is not None
+        and layerwise_args.batch_group_size < 1
+    ):
+        raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)

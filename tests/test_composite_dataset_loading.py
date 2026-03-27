@@ -15,11 +15,7 @@ REAL_COMPOSITE_SPEC = (
 
 def test_composite_dataset_loading_with_real_hf_datasets():
     from transformers import AutoTokenizer
-
-    try:
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-30B-A3B-Instruct-2507")
-    except Exception as exc:
-        pytest.skip(f"Required tokenizer could not be loaded: {exc}")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Coder-30B-A3B-Instruct")
 
     composite_components = parse_composite_dataset_spec(
         REAL_COMPOSITE_SPEC,
@@ -40,24 +36,18 @@ def test_composite_dataset_loading_with_real_hf_datasets():
 
     combined_batches = []
     for component in composite_components:
-        try:
-            component_batches = load_category_batches(
-                dataset_name=component.name,
-                split=component.split,
-                subset=component.subset,
-                tokenizer=tokenizer,
-                model_max_length=2048,
-                split_by_category=False,
-                return_vllm_tokens_prompt=False,
-                truncate=True,
-                samples_per_category=1,
-                batch_size=2,
-            )
-        except Exception as exc:
-            pytest.skip(
-                f"Real dataset component {component.name} could not be loaded with "
-                f"subset={component.subset} split={component.split}: {exc}"
-            )
+        component_batches = load_category_batches(
+            dataset_name=component.name,
+            split=component.split,
+            subset=component.subset,
+            tokenizer=tokenizer,
+            model_max_length=2048,
+            split_by_category=False,
+            return_vllm_tokens_prompt=False,
+            truncate=True,
+            samples_per_category=1,
+            batch_size=2,
+        )
 
         assert list(component_batches.keys()) == ["all"]
         assert len(component_batches["all"]) == 1

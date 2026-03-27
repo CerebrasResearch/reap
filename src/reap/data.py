@@ -60,6 +60,39 @@ def _normalize_message_content(content) -> str:
     return str(content)
 
 
+def _normalize_messages_for_chat_template(messages):
+    if not isinstance(messages, list):
+        return messages
+
+    normalized_messages = []
+    for message in messages:
+        if not isinstance(message, dict) or not message.get("tool_calls"):
+            normalized_messages.append(message)
+            continue
+
+        normalized_message = dict(message)
+        normalized_tool_calls = []
+        for tool_call in message["tool_calls"]:
+            if not isinstance(tool_call, dict) or not isinstance(
+                tool_call.get("function"), dict
+            ):
+                normalized_tool_calls.append(tool_call)
+                continue
+
+            normalized_tool_call = dict(tool_call)
+            normalized_function = dict(tool_call["function"])
+            normalized_function["arguments"] = _maybe_json_load(
+                normalized_function.get("arguments")
+            )
+            normalized_tool_call["function"] = normalized_function
+            normalized_tool_calls.append(normalized_tool_call)
+
+        normalized_message["tool_calls"] = normalized_tool_calls
+        normalized_messages.append(normalized_message)
+
+    return normalized_messages
+
+
 @dataclass
 class CompositeDatasetComponent:
     """A single component of a composite dataset specification.
@@ -557,10 +590,11 @@ class BaseDatasetProcessor(ABC):
 class ChatDatasetProcessor(BaseDatasetProcessor):
     def _encode_sample(self, sample: dict) -> torch.Tensor:
         chat_template_kwargs = {}
+        messages = _normalize_messages_for_chat_template(sample[self.messages_field])
         if self.tools_field in sample:
             chat_template_kwargs = {"tools": _maybe_json_load(sample[self.tools_field])}
         chat_sample = self.tokenizer.apply_chat_template(
-            sample[self.messages_field],
+            messages,
             add_generation_prompt=False,
             tokenize=False,
             **chat_template_kwargs,
@@ -578,12 +612,15 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
         def chat_template_fn(sample: dict[str, any]) -> dict[str, any]:
             """Apply chat template to the sample."""
             chat_template_kwargs = {}
+            messages = _normalize_messages_for_chat_template(
+                sample[self.messages_field]
+            )
             if self.tools_field in sample:
                 chat_template_kwargs = {
                     "tools": _maybe_json_load(sample[self.tools_field])
                 }
             chat_sample = self.tokenizer.apply_chat_template(
-                sample[self.messages_field],
+                messages,
                 add_generation_prompt=False,
                 tokenize=False,
                 **chat_template_kwargs,

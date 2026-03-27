@@ -888,16 +888,16 @@ class LayerwiseMoEObserver:
             self._unload_current_block()
 
     @torch.inference_mode()
-    def collect_all_blocks(
+    def _collect_all_blocks_for_batch_group(
         self,
         data_batches: List[torch.Tensor],
         save_path: Optional[pathlib.Path] = None,
     ) -> Dict[int, Dict[str, Any]]:
         """
-        Process all blocks sequentially with optimized memory usage.
+        Process all blocks for a single batch group.
 
         Args:
-            data_batches: List of input batches to process
+            data_batches: List of input batches to process for this group
             save_path: Optional path to save intermediate results
 
         Returns:
@@ -933,6 +933,60 @@ class LayerwiseMoEObserver:
         self._clear_cache()
 
         logger.info(f"Completed processing all {len(self.layers)} blocks")
+        return self.report_state()
+
+    @torch.inference_mode()
+    def collect_all_blocks(
+        self,
+        data_batches: List[torch.Tensor],
+        save_path: Optional[pathlib.Path] = None,
+        batch_group_size: Optional[int] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Process all blocks sequentially, optionally in groups of batches.
+
+        Args:
+            data_batches: List of input batches to process
+            save_path: Optional path to save intermediate results
+            batch_group_size: Optional maximum number of batches to cache and process
+                per group. If None, all batches are processed in one pass.
+
+        Returns:
+            Dictionary mapping layer numbers to their metrics
+        """
+        if batch_group_size is None or batch_group_size >= len(data_batches):
+            return self._collect_all_blocks_for_batch_group(data_batches, save_path)
+
+        if batch_group_size < 1:
+            raise ValueError("batch_group_size must be at least 1 when provided")
+
+        total_groups = (len(data_batches) + batch_group_size - 1) // batch_group_size
+        logger.info(
+            "Processing %s blocks across %s batch groups of up to %s batches",
+            len(self.layers),
+            total_groups,
+            batch_group_size,
+        )
+
+        for group_idx, start in enumerate(range(0, len(data_batches), batch_group_size)):
+            end = min(start + batch_group_size, len(data_batches))
+            batch_group = data_batches[start:end]
+            group_save_path = save_path
+            if group_save_path is not None:
+                group_save_path = group_save_path / f"group_{group_idx:03d}"
+
+            logger.info(
+                "Processing batch group %s/%s with %s batches",
+                group_idx + 1,
+                total_groups,
+                len(batch_group),
+            )
+            self._collect_all_blocks_for_batch_group(
+                data_batches=batch_group,
+                save_path=group_save_path,
+            )
+            cleanup_memory()
+
         return self.report_state()
 
     def _clear_cache(self):
