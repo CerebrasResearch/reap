@@ -45,11 +45,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class LayerwiseMoEObserverConfig(MoETransformerObserverConfig):
-    """Configuration for layerwise MoE observer."""
-
-
 class LayerwiseMoEObserver:
     """
     Memory-efficient MoE observer that processes one transformer block at a time.
@@ -82,7 +77,7 @@ class LayerwiseMoEObserver:
     def __init__(
         self,
         model: nn.Module,
-        hook_config: LayerwiseMoEObserverConfig,
+        hook_config: MoETransformerObserverConfig,
         block_names: Optional[List[str]] = None,
     ):
         """

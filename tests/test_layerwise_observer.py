@@ -3,7 +3,7 @@ import copy
 import torch
 from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
-from reap.layerwise_observer import LayerwiseMoEObserver, LayerwiseMoEObserverConfig
+from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.observer import MoETransformerObserver, Qwen3MoEObserverHookConfig
 
 
@@ -23,21 +23,6 @@ def _make_qwen3_moe_model(num_hidden_layers=1):
     model = Qwen3MoeForCausalLM(config)
     model.eval()
     return model
-
-
-def _make_layerwise_config():
-    base_config = Qwen3MoEObserverHookConfig(record_pruning_metrics_only=True)
-    layerwise_config = LayerwiseMoEObserverConfig(
-        num_experts_attr_name=base_config.num_experts_attr_name,
-        top_k_attr_name=base_config.top_k_attr_name,
-        fused_experts=base_config.fused_experts,
-        renormalize_router_weights=base_config.renormalize_router_weights,
-        record_pruning_metrics_only=True,
-    )
-    layerwise_config.module_class_name_to_hook_regex = (
-        base_config.module_class_name_to_hook_regex
-    )
-    return layerwise_config
 
 
 def _assert_layerwise_states_match(actual_state, expected_state):
@@ -78,9 +63,11 @@ def test_layerwise_observer_matches_standard_observer_for_batched_input():
         "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.long),
     }
 
+    hook_config = Qwen3MoEObserverHookConfig(record_pruning_metrics_only=True)
+
     observer = MoETransformerObserver(
         model,
-        hook_config=Qwen3MoEObserverHookConfig(record_pruning_metrics_only=True),
+        hook_config=hook_config,
     )
     with observer.set_attention_mask(batch["attention_mask"]):
         _ = model(**batch)
@@ -89,7 +76,7 @@ def test_layerwise_observer_matches_standard_observer_for_batched_input():
 
     layerwise_observer = LayerwiseMoEObserver(
         layerwise_model,
-        hook_config=_make_layerwise_config(),
+        hook_config=hook_config,
     )
     layerwise_state = layerwise_observer.collect_all_blocks([batch])
     layerwise_observer.close_hooks()
@@ -141,6 +128,7 @@ def test_layerwise_observer_grouped_batches_match_single_pass():
 
     model = _make_qwen3_moe_model(num_hidden_layers=2)
     grouped_model = copy.deepcopy(model)
+    hook_config = Qwen3MoEObserverHookConfig(record_pruning_metrics_only=True)
 
     batches = [
         {
@@ -165,14 +153,14 @@ def test_layerwise_observer_grouped_batches_match_single_pass():
 
     single_pass_observer = LayerwiseMoEObserver(
         model,
-        hook_config=_make_layerwise_config(),
+        hook_config=hook_config,
     )
     single_pass_state = single_pass_observer.collect_all_blocks(batches)
     single_pass_observer.close_hooks()
 
     grouped_observer = LayerwiseMoEObserver(
         grouped_model,
-        hook_config=_make_layerwise_config(),
+        hook_config=hook_config,
     )
     grouped_state = grouped_observer.collect_all_blocks(batches, batch_group_size=1)
     grouped_observer.close_hooks()

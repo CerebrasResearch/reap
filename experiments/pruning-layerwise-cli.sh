@@ -87,7 +87,7 @@ bash experiments/eval.sh \
     ${run_livecodebench} \
     ${run_math} \
     ${run_wildbench}
-echo "Finished evaluating model: ${pruned_model}"
+echo "Finished evaluating model: ${model_dir}"
 
 # echo "Removing safetensor files from ${model_dir}"
 # rm ${model_dir}/*.safetensors

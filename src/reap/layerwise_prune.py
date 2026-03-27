@@ -46,7 +46,7 @@ from reap.args import (
 from reap.data import load_category_batches, parse_composite_dataset_spec
 from reap.model_util import patched_model_map
 from reap.observer import OBSERVER_CONFIG_REGISTRY
-from reap.layerwise_observer import LayerwiseMoEObserver, LayerwiseMoEObserverConfig
+from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
 from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
@@ -198,27 +198,15 @@ def record_activations_layerwise(
             f"Supported: {list(OBSERVER_CONFIG_REGISTRY.keys())}"
         )
 
-    base_config = OBSERVER_CONFIG_REGISTRY[model_class_name]()
-
-    # Create layerwise config
-    # NOTE: module_class_name_to_hook_regex is inherited from the non-dataclass
-    # BaseTransformerObserverHookConfig and is not part of the generated __init__,
-    # so it must be set as an attribute after construction.
-    layerwise_config = LayerwiseMoEObserverConfig(
-        num_experts_attr_name=base_config.num_experts_attr_name,
-        top_k_attr_name=base_config.top_k_attr_name,
-        fused_experts=base_config.fused_experts,
+    hook_config = OBSERVER_CONFIG_REGISTRY[model_class_name](
         renormalize_router_weights=obs_args.renormalize_router_weights,
         record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
-    )
-    layerwise_config.module_class_name_to_hook_regex = (
-        base_config.module_class_name_to_hook_regex
     )
 
     # Create layerwise observer
     observer = LayerwiseMoEObserver(
         model=model,
-        hook_config=layerwise_config,
+        hook_config=hook_config,
     )
 
     # Process all blocks

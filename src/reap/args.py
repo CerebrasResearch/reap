@@ -82,8 +82,6 @@ class DatasetArgs:
                 "Example: 'theblackcat102/evol-codealpaca-v1:4096,"
                 "open-r1/Mixture-of-Thoughts[code]:4096,"
                 "SWE-bench/SWE-smith-trajectories(tool):4096'. "
-                "open-r1/Mixture-of-Thoughts[code]:4096,"
-                "open-r1/Mixture-of-Thoughts[math]:4096'. "
                 "Use 'combined' to load pre-recorded combined observation data."
             ),            
         },
@@ -517,7 +515,7 @@ class PruneArgs:
         default=False,
         metadata={
             "help": (
-                r"Whether to perserve super experts when pruning. Excludes last 25% of layers"
+                r"Whether to perserve super experts when pruning. Excludes last 25%% of layers"
             )
         }
     )
