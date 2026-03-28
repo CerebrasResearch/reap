@@ -99,7 +99,7 @@ class DatasetArgs:
 
 @dataclass
 class ObserverArgs:
-    samples_per_category: int = 1024
+    batches_per_category: int = 1024
     split_by_category: bool = False
     select_only_categories: list[str] | str | None = field(
         default=None,
@@ -515,7 +515,7 @@ class PruneArgs:
         default=False,
         metadata={
             "help": (
-                r"Whether to perserve super experts when pruning. Excludes last 25% of layers"
+                r"Whether to perserve super experts when pruning. Excludes last 25%% of layers"
             )
         }
     )
@@ -528,6 +528,41 @@ class PruneArgs:
         }
     )
 
+
+@dataclass
+class LayerwiseArgs:
+    """Arguments for layerwise (memory-efficient) calibration."""
+
+    batch_group_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Number of pre-tokenized calibration batches to process at a time. "
+                "If set, the layerwise observer processes one group through all blocks "
+                "before moving to the next group, which reduces CPU RAM usage from "
+                "cached first-layer inputs."
+            )
+        },
+    )
+    save_intermediate: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to save intermediate results after each block during layerwise "
+                "calibration. Useful for debugging and recovery."
+            )
+        },
+    )
+    low_cpu_mem_usage: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Use memory-efficient model loading. Recommended for large models."
+            )
+        },
+    )
+
+    
 @dataclass
 class QuantizationArgs:
     quantization_method: str = field(
