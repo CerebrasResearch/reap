@@ -16,8 +16,7 @@ only loads embeddings + one block at a time.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import gc
 import inspect
 import logging
@@ -115,7 +114,7 @@ class LayerwiseMoEObserver:
         self.state: Dict[int, Dict[str, Any]] = {}
 
         # MoE module cache per block
-        self._moe_modules_cache: Dict[int, nn.Module] = {}
+        self._moe_modules_cache: Dict[int, Optional[nn.Module]] = {}
 
         # Forward signature cache per block
         self._forward_signature_cache: Dict[int, Tuple[set[str], bool]] = {}
@@ -176,6 +175,7 @@ class LayerwiseMoEObserver:
         logger.warning(
             f"No MoE module found in block {block_idx} matching {moe_class_name}"
         )
+        self._moe_modules_cache[block_idx] = None
         return None
 
     def _initialize_layer_state(self, num_experts: int) -> Dict[str, Any]:
@@ -768,24 +768,15 @@ class LayerwiseMoEObserver:
         gc.collect()
 
     @torch.inference_mode()
-    def collect_activations_for_block(
+    def _forward_block(
         self,
         block_idx: int,
-        data_batches: List[torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Collect MoE activations and compute metrics for a single block.
-
-        Args:
-            block_idx: Index of the block to process
-            data_batches: List of input batches
-
-        Returns:
-            Dictionary with computed metrics for this block
-        """
-        if block_idx == 0:
-            self._capture_first_layer_inputs(data_batches)
-
+        before_forward: Optional[Callable[[int], None]] = None,
+        after_forward: Optional[
+            Callable[[int, torch.device, Optional[torch.Tensor]], None]
+        ] = None,
+    ) -> Dict[str, Any]:
+        """Forward cached hidden states through a single transformer block."""
         block_name = (
             self.block_names[block_idx]
             if block_idx < len(self.block_names)
@@ -807,27 +798,16 @@ class LayerwiseMoEObserver:
             device_str = "cuda" if torch.cuda.is_available() else "cpu"
         target_device = torch.device(device_str)
 
-        # Find MoE module in this block
-        moe_module = self._find_moe_module_in_block(block_idx)
-        captured_moe_input: Dict[str, torch.Tensor] = {}
-
-        if moe_module is None:
-            logger.warning(
-                f"No MoE module found in block {block_idx}; continuing without MoE metrics"
-            )
-        else:
-            # Register a forward hook on the MoE module to capture its input
-            def _capture_moe_input_hook(module, args, output):
-                captured_moe_input["input"] = args[0].detach()
-                return output
-
-            moe_hook_handle = moe_module.register_forward_hook(_capture_moe_input_hook)
-
         try:
+            if block_idx == 0 and not self.layer_inputs_cache:
+                raise ValueError(
+                    "First block inputs have not been captured; call "
+                    "_capture_first_layer_inputs before forwarding block 0"
+                )
             if not self.layer_inputs_cache:
                 raise ValueError("No cached layer inputs available")
 
-            num_batches = min(len(self.layer_inputs_cache), len(data_batches))
+            num_batches = len(self.layer_inputs_cache)
             layer_outputs = []
 
             for batch_idx in tqdm(range(num_batches), desc=f"Processing {block_name}"):
@@ -837,7 +817,8 @@ class LayerwiseMoEObserver:
                 attention_mask = layer_kwargs.get("attention_mask", None)
 
                 layer_kwargs = self._build_replay_kwargs(block_idx, layer_kwargs)
-                captured_moe_input.clear()
+                if before_forward is not None:
+                    before_forward(batch_idx)
 
                 with torch.amp.autocast(device_type="cuda", enabled=False):
                     outputs = layer(*layer_input, **layer_kwargs)
@@ -847,28 +828,16 @@ class LayerwiseMoEObserver:
                 else:
                     hidden_states = outputs
 
-                if moe_module is not None:
-                    moe_input = captured_moe_input["input"]
-                    
-                    self._process_moe_activations(
-                        block_idx,
-                        moe_module,
-                        moe_input,
-                        target_device,
-                        attention_mask=attention_mask,
-                    )
+                if after_forward is not None:
+                    after_forward(batch_idx, target_device, attention_mask)
 
                 layer_outputs.append([hidden_states.detach().cpu()])
 
                 del outputs, hidden_states, layer_input, layer_kwargs
-                if moe_module is not None:
-                    del moe_input
-                captured_moe_input.clear()
 
                 if batch_idx % 4 == 0:
                     cleanup_memory(synchronize=False)
 
-            # Update cache for next layer
             if block_idx < len(self.layers) - 1:
                 del self.layer_inputs_cache
                 self.layer_inputs_cache = layer_outputs
@@ -878,9 +847,71 @@ class LayerwiseMoEObserver:
             return self.state.get(block_idx, {})
 
         finally:
+            self._unload_current_block()
+
+    @torch.inference_mode()
+    def collect_activations_for_block(
+        self,
+        block_idx: int,
+        moe_module: Optional[nn.Module] = None,
+    ) -> Dict[str, Any]:
+        """
+        Collect MoE activations and compute metrics for a single block.
+
+        Args:
+            block_idx: Index of the block to process
+            moe_module: Optional pre-resolved MoE module for this block
+
+        Returns:
+            Dictionary with computed metrics for this block
+        """
+        if moe_module is None:
+            moe_module = self._find_moe_module_in_block(block_idx)
+            if moe_module is None:
+                return self._forward_block(block_idx)
+
+        captured_moe_input: Dict[str, torch.Tensor] = {}
+        moe_hook_handle = None
+
+        def _capture_moe_input_hook(module, args, output):
+            captured_moe_input["input"] = args[0].detach()
+            return output
+
+        def _before_forward(_batch_idx: int) -> None:
+            captured_moe_input.clear()
+
+        def _after_forward(
+            _batch_idx: int,
+            target_device: torch.device,
+            attention_mask: Optional[torch.Tensor],
+        ) -> None:
+            moe_input = captured_moe_input.get("input")
+            if moe_input is None:
+                raise RuntimeError(f"Failed to capture MoE input for block {block_idx}")
+
+            self._process_moe_activations(
+                block_idx,
+                moe_module,
+                moe_input,
+                target_device,
+                attention_mask=attention_mask,
+            )
+
+            del moe_input
+            captured_moe_input.clear()
+
+        moe_hook_handle = moe_module.register_forward_hook(_capture_moe_input_hook)
+
+        try:
+            return self._forward_block(
+                block_idx,
+                before_forward=_before_forward,
+                after_forward=_after_forward,
+            )
+
+        finally:
             if moe_hook_handle is not None:
                 moe_hook_handle.remove()
-            self._unload_current_block()
 
     @torch.inference_mode()
     def _collect_all_blocks_for_batch_group(
@@ -905,8 +936,15 @@ class LayerwiseMoEObserver:
             f"Processing {len(self.layers)} blocks with {len(data_batches)} batches"
         )
 
+        self._capture_first_layer_inputs(data_batches)
+
         for block_idx in range(len(self.layers)):
-            self.collect_activations_for_block(block_idx, data_batches)
+            moe_module = self._find_moe_module_in_block(block_idx)
+            if moe_module is None:
+                logger.warning(f"No MoE module in block {block_idx}, forwarding only")
+                self._forward_block(block_idx)
+            else:
+                self.collect_activations_for_block(block_idx, moe_module=moe_module)
 
             # Save intermediate results
             if save_path:

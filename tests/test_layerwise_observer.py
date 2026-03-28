@@ -1,10 +1,19 @@
 import copy
 
 import torch
-from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+from transformers import (
+    Ernie4_5_MoeConfig,
+    Ernie4_5_MoeForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+)
 
 from reap.layerwise_observer import LayerwiseMoEObserver
-from reap.observer import MoETransformerObserver, Qwen3MoEObserverHookConfig
+from reap.observer import (
+    Ernie4_5MoEObserverHookConfig,
+    MoETransformerObserver,
+    Qwen3MoEObserverHookConfig,
+)
 
 
 def _make_qwen3_moe_model(num_hidden_layers=1):
@@ -21,6 +30,23 @@ def _make_qwen3_moe_model(num_hidden_layers=1):
         norm_topk_prob=False,
     )
     model = Qwen3MoeForCausalLM(config)
+    model.eval()
+    return model
+
+
+def _make_ernie4_5_partial_moe_model(num_hidden_layers=3):
+    config = Ernie4_5_MoeConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        moe_num_experts=2,
+        moe_k=1,
+    )
+    model = Ernie4_5_MoeForCausalLM(config)
     model.eval()
     return model
 
@@ -166,3 +192,33 @@ def test_layerwise_observer_grouped_batches_match_single_pass():
     grouped_observer.close_hooks()
 
     _assert_layerwise_states_match(grouped_state, single_pass_state)
+
+
+def test_layerwise_observer_forwards_dense_blocks_in_partial_moe_model():
+    torch.manual_seed(0)
+
+    model = _make_ernie4_5_partial_moe_model()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.long),
+    }
+    hook_config = Ernie4_5MoEObserverHookConfig(
+        module_class_name_to_hook_regex="Ernie4_5_MoeSparseMoeBlock",
+        num_experts_attr_name="num_experts",
+        top_k_attr_name="top_k",
+        record_pruning_metrics_only=True,
+    )
+
+    layerwise_observer = LayerwiseMoEObserver(
+        model,
+        hook_config=hook_config,
+    )
+    try:
+        layerwise_state = layerwise_observer.collect_all_blocks([batch])
+    finally:
+        layerwise_observer.close_hooks()
+
+    expected_tokens = batch["attention_mask"].sum().item()
+    assert set(layerwise_state) == {1, 2}
+    assert layerwise_state[1]["total_tokens"].item() == expected_tokens
+    assert layerwise_state[2]["total_tokens"].item() == expected_tokens
