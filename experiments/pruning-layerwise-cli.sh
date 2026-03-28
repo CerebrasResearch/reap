@@ -34,9 +34,9 @@ run_math=${10:-false}
 run_wildbench=${11:-false}
 singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
-num_samples=128
+num_batches=128
 batch_size=8
-output_file_name="observations_${num_samples}_cosine-seed_${seed}.pt"
+output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
 server_log_file_name="pruning-cli-${FIRST_DEVICE}.log"
@@ -58,7 +58,7 @@ python -m reap.layerwise_prune \
     --do-eval false \
     --seed $seed \
     --output_file_name ${output_file_name} \
-    --batches_per_category ${num_samples} \
+    --batches_per_category ${num_batches} \
     --batch_size ${batch_size} \
     --low_cpu_mem_usage True
 
