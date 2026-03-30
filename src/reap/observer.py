@@ -7,7 +7,6 @@ from functools import reduce
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import re
 from dataclasses import dataclass
 import logging
@@ -21,6 +20,7 @@ from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
 )
+from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -273,16 +273,7 @@ class MoETransformerObserver(BaseTransformerObserver):
         output_hidden_states = output[0]
         device = "cpu"
         hidden_dim = output_hidden_states.shape[-1]
-        layer_state = {}
-
-        # unnormalized states (counts)
-        layer_state["total_tokens"] = torch.tensor(0, device=device, dtype=torch.long)
-        layer_state["expert_frequency"] = torch.zeros(
-            num_experts, device=device, dtype=torch.long
-        )
-        layer_state["pairwise_expert_frequency"] = torch.zeros(
-            num_experts, num_experts, dtype=torch.long, device=device
-        )
+        layer_state = initialize_pruning_state(num_experts, device=device)
 
         if not self.hook_config.record_pruning_metrics_only:
             # per routed token normalized states
@@ -319,36 +310,6 @@ class MoETransformerObserver(BaseTransformerObserver):
                 device=device,
                 dtype=torch.float32,
             )
-
-        # Expert Activation Norm
-        layer_state["ean_sum"] = torch.zeros(
-            (num_experts,), device=device, dtype=torch.float64, requires_grad=False
-        )
-        layer_state["weighted_ean_sum"] = torch.zeros(
-            (num_experts,), device=device, dtype=torch.float64, requires_grad=False
-        )
-        layer_state["ean_mean"] = OnlineStatsTracker(
-            shape=(num_experts,),
-            count_shape=(num_experts,),
-            device=device,
-            dtype=torch.float32,
-        )
-        layer_state["reap"] = OnlineStatsTracker(
-            shape=(num_experts,),
-            count_shape=(num_experts,),
-            device=device,
-            dtype=torch.float32,
-        )
-
-        # Weighted frequency
-        layer_state["weighted_expert_frequency_sum"] = torch.zeros(
-            (num_experts,), device=device, dtype=torch.float64, requires_grad=False
-        )
-
-        # super experts
-        layer_state["max_activations"] = torch.zeros(
-            (num_experts,), device=device, dtype=torch.float32, requires_grad=False
-        )
 
         return layer_state
 
@@ -422,65 +383,43 @@ class MoETransformerObserver(BaseTransformerObserver):
 
             del flat_input
             
-            # Filter out padding tokens if attention mask is provided
-            if flat_mask is not None:
-                num_tokens = flat_mask.sum().item()
-                # Filter selected_experts: (total_tokens, top_k) -> (num_valid_tokens, top_k)
-                selected_experts = selected_experts[flat_mask]
-                # Filter activations: (num_experts, total_tokens, hidden_dim) -> (num_experts, num_valid_tokens, hidden_dim)
-                activations = activations[:, flat_mask, :]
-                # Filter router_logits: (total_tokens, num_experts) -> (num_valid_tokens, num_experts)
-                router_logits = router_logits[flat_mask]
-            else:
-                num_tokens = batch_size * sequence_length
-
-            num_tokens = torch.tensor(num_tokens, device="cpu", dtype=torch.long)
-
-            # --- PRUNE/MERGE SALIENCY CRITERIA --------------------------------
-            # expert frequency
-            expert_frequency = torch.bincount(
-                selected_experts.view(-1), minlength=num_experts
-            ).to(device)
-            pairwise_expert_frequency = expert_frequency.unsqueeze(
-                0
-            ) + expert_frequency.unsqueeze(1)
-            pairwise_expert_frequency = pairwise_expert_frequency.to(device)
-
-            self.state[layer_number]["total_tokens"] += num_tokens
-            self.state[layer_number]["expert_frequency"] += expert_frequency.to(
-                "cpu", torch.long
-            )
-            self.state[layer_number]["pairwise_expert_frequency"] += (
-                pairwise_expert_frequency.to("cpu", torch.long)
+            pruning_batch = update_pruning_state(
+                self.state[layer_number],
+                activations=activations,
+                selected_experts=selected_experts,
+                router_logits=router_logits,
+                num_experts=num_experts,
+                valid_token_mask=flat_mask,
+                renormalize_router_weights=self.hook_config.renormalize_router_weights,
             )
 
             # Merging critera
             if not self.hook_config.record_pruning_metrics_only:
                 ttm_similarity_matrix = ttm_online(
-                    activations,
-                    selected_experts,
+                    pruning_batch.activations,
+                    pruning_batch.selected_experts,
                     distance_callable=distance_fn,
                     num_experts=num_experts,
-                    pairwise_expert_frequency=pairwise_expert_frequency,
+                    pairwise_expert_frequency=pruning_batch.pairwise_expert_frequency,
                 )
 
                 # ttm_similarity_matrix with pairwise frequency counts
                 self.state[layer_number]["ttm_similarity_matrix"].update(
-                    ttm_similarity_matrix, pairwise_expert_frequency
+                    ttm_similarity_matrix, pruning_batch.pairwise_expert_frequency
                 )
                 del ttm_similarity_matrix
 
                 routed_characteristic_activation = get_routed_characteristic_activation(
-                    activations,
-                    selected_experts,
-                    expert_frequency,
+                    pruning_batch.activations,
+                    pruning_batch.selected_experts,
+                    pruning_batch.expert_frequency,
                     device,
                     hidden_dim,
                     num_experts,
                 )
 
                 # routed_characteristic_activation with expert frequency counts
-                expert_freq_expanded = expert_frequency.unsqueeze(-1).expand(
+                expert_freq_expanded = pruning_batch.expert_frequency.unsqueeze(-1).expand(
                     (-1, hidden_dim)
                 )
                 self.state[layer_number]["routed_characteristic_activation"].update(
@@ -489,13 +428,13 @@ class MoETransformerObserver(BaseTransformerObserver):
                 del expert_freq_expanded, routed_characteristic_activation
 
                 online_characteristic_activation_dist = ca_dist_online(
-                    activations,
+                    pruning_batch.activations,
                     distance_callable=distance_fn,
                 ).to(device="cpu")
 
                 # online_characteristic_activation_dist with expert frequency counts
                 self.state[layer_number]["online_characteristic_activation_dist"].update(
-                    online_characteristic_activation_dist, num_tokens
+                    online_characteristic_activation_dist, pruning_batch.num_tokens
                 )
                 del online_characteristic_activation_dist
 
@@ -503,10 +442,10 @@ class MoETransformerObserver(BaseTransformerObserver):
                 # dim 0 "batch" dim, dims 1,2 expert pairwise, dim 3 token logits
                 router_logit_sim = (
                     distance_fn(
-                        router_logits.permute(1, 0).view(
+                        pruning_batch.router_logits.permute(1, 0).view(
                             1, num_experts, 1, -1
                         ),  # 1, num_experts, 1, logits
-                        router_logits.permute(1, 0).view(
+                        pruning_batch.router_logits.permute(1, 0).view(
                             1, 1, num_experts, -1
                         ),  # 1, 1, num_experts, logits
                     )
@@ -516,99 +455,21 @@ class MoETransformerObserver(BaseTransformerObserver):
 
                 # router_logit_similarity with total tokens count
                 self.state[layer_number]["router_logit_similiarity"].update(
-                    router_logit_sim, num_tokens
+                    router_logit_sim, pruning_batch.num_tokens
                 )
                 del router_logit_sim
 
                 # characteristic_activation with total tokens count
                 self.state[layer_number]["characteristic_activation"].update(
-                    activations.mean(dim=1), num_tokens
+                    pruning_batch.activations.mean(dim=1), pruning_batch.num_tokens
                 )
-
-            # Pruning criteria
-            ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
-            ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
-            weighted_ean_sum = torch.zeros(
-                num_experts, device=device, dtype=torch.float64
-            )
-            reap = torch.zeros(
-                num_experts, device=device, dtype=torch.float32
-            )
-            weighted_expert_frequency_sum = torch.zeros(
-                num_experts, device=device, dtype=torch.float64
-            )
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(
-                device
-            )  # tok, num_experts
-            prior_max_activations = self.state[layer_number]["max_activations"]
-            # renormalize
-            if self.hook_config.renormalize_router_weights:
-                topk_weights = torch.gather(
-                    routing_weights,
-                    1,
-                    selected_experts,
-                )  # (total_tokens, top_k)
-                routing_weights = routing_weights / topk_weights.sum(
-                    dim=-1, keepdim=True
-                )
-                routing_weights = torch.clamp(
-                    routing_weights, min=torch.finfo(routing_weights.dtype).eps
-                )
-                # routing_weights = routing_weights.to(device)
-
-            for i in range(num_experts):
-                active_mask = (selected_experts == i).any(dim=-1).to(device)
-                if not active_mask.any():
-                    continue
-                active_router_weights = routing_weights[active_mask, i]
-                ean_norm = torch.linalg.norm(activations[i, active_mask, :], dim=-1)
-                ean_sum[i] = ean_norm.sum().to(device)
-                ean_mean[i] = ean_norm.mean().to(device)
-                weighted_expert_frequency_sum[i] = active_router_weights.sum().to(
-                    device
-                )
-                weighted_ean_sum[i] = (
-                    (ean_norm * active_router_weights).sum().to(device)
-                )
-                reap[i] = (
-                    (ean_norm * active_router_weights).mean().to(device)
-                )
-
-                # super experts
-                selected_activations = activations[i, active_mask, :]
-                selected_activations_max = selected_activations.max().to(device="cpu")
-                if selected_activations_max > prior_max_activations[i]:
-                    self.state[layer_number]["max_activations"][i] = (
-                        selected_activations_max
-                    )
-                    prior_max_activations[i] = selected_activations_max
-
-            # ean
-            self.state[layer_number]["ean_sum"] += ean_sum.to(device="cpu")
-            self.state[layer_number]["ean_mean"].update(ean_mean, expert_frequency)
-            self.state[layer_number]["weighted_ean_sum"] += weighted_ean_sum.to(
-                device="cpu"
-            )
-            if reap.sum() == 0:
-                print("debug")
-            self.state[layer_number]["reap"].update(
-                reap, expert_frequency
-            )
-
-            # weighted_expert_frequency_sum
-            
-            self.state[layer_number]["weighted_expert_frequency_sum"] += (
-                weighted_expert_frequency_sum.to(device="cpu")
-            )
 
             # --- CLEAN UP -------------------------------------------------------------
             del (
                 activations,
                 selected_experts,
                 router_logits,
-                expert_frequency,
-                pairwise_expert_frequency,
-                prior_max_activations,
+                pruning_batch,
             )
             gc.collect()
 

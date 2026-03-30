@@ -1,6 +1,7 @@
 # Router-weighted Expert Activation Pruning (REAP)
 
 ## Updates
+* 2026-03-30: We have added a memory-efficient layer-wise (block-wise) calibration observer for pruning large models on a single GPU (see `experiments/pruning-layerwise-cli.sh` on how to run layer-wise calibration).
 * 2026-03-19: We have released our data calibration mix recipe for agentic reasoning REAP-compressed models published on HuggingFace (see [details](#huggingface-checkpoints)).
 * 2026-03-11: For REAP saliency, top-k router logits are now correctly renormalized to sum to 1. See `args.py:ObserverArgs.renormalize_router_weights`. Generally, you can expect a modest improvement for most model/datasets with this fix in place. On non-agentic coding evaluations across ERNIE-4.5-21B-A3B-PT, Qwen3-30B-A3B, Mixtral-8x7B-Instruct-v0.1, GLM-4.5-Air,and Llama-4-Scout-17B-16E-Instruct, REAP achieves a mean decrease in accuracy of 1.9% vs. 2.6% without logit normalization. Our prior large-scale results and all Cerebras checkpoints on previously calibrated with normalized logits. 
 * 2026-03-01: REAP has been accepted to ICLR 2026, see you in Rio! 

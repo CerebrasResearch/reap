@@ -60,6 +60,39 @@ def _normalize_message_content(content) -> str:
     return str(content)
 
 
+def _normalize_messages_for_chat_template(messages):
+    if not isinstance(messages, list):
+        return messages
+
+    normalized_messages = []
+    for message in messages:
+        if not isinstance(message, dict) or not message.get("tool_calls"):
+            normalized_messages.append(message)
+            continue
+
+        normalized_message = dict(message)
+        normalized_tool_calls = []
+        for tool_call in message["tool_calls"]:
+            if not isinstance(tool_call, dict) or not isinstance(
+                tool_call.get("function"), dict
+            ):
+                normalized_tool_calls.append(tool_call)
+                continue
+
+            normalized_tool_call = dict(tool_call)
+            normalized_function = dict(tool_call["function"])
+            normalized_function["arguments"] = _maybe_json_load(
+                normalized_function.get("arguments")
+            )
+            normalized_tool_call["function"] = normalized_function
+            normalized_tool_calls.append(normalized_tool_call)
+
+        normalized_message["tool_calls"] = normalized_tool_calls
+        normalized_messages.append(normalized_message)
+
+    return normalized_messages
+
+
 @dataclass
 class CompositeDatasetComponent:
     """A single component of a composite dataset specification.
@@ -70,26 +103,26 @@ class CompositeDatasetComponent:
                the default split from DatasetArgs.
         subset: HF dataset config/subset name (e.g., "code", "math"). None means
                 do not pass a subset to ``load_dataset``.
-        num_samples: Number of samples to draw from this component.
+        num_batches: Number of batches to draw from this component.
     """
 
     name: str
     split: str | None
     subset: str | None
-    num_samples: int
+    num_batches: int
 
 
-# Regex to parse a single component: <name>[<subset>](<split>):<num_samples>
+# Regex to parse a single component: <name>[<subset>](<split>):<num_batches>
 # Examples:
-#   "theblackcat102/evol-codealpaca-v1:4096"            -> name="theblackcat102/evol-codealpaca-v1", subset=None, split=None, num_samples=4096
-#   "open-r1/Mixture-of-Thoughts[code]:4096"            -> name="open-r1/Mixture-of-Thoughts", subset="code", split=None, num_samples=4096
-#   "SWE-bench/SWE-smith-trajectories(tool):4096"      -> name="SWE-bench/SWE-smith-trajectories", subset=None, split="tool", num_samples=4096
-#   "dataset[subset](split):4096"                      -> name="dataset", subset="subset", split="split", num_samples=4096
+#   "theblackcat102/evol-codealpaca-v1:4096"            -> name="theblackcat102/evol-codealpaca-v1", subset=None, split=None, num_batches=4096
+#   "open-r1/Mixture-of-Thoughts[code]:4096"            -> name="open-r1/Mixture-of-Thoughts", subset="code", split=None, num_batches=4096
+#   "SWE-bench/SWE-smith-trajectories(tool):4096"      -> name="SWE-bench/SWE-smith-trajectories", subset=None, split="tool", num_batches=4096
+#   "dataset[subset](split):4096"                      -> name="dataset", subset="subset", split="split", num_batches=4096
 _COMPOSITE_COMPONENT_RE = re.compile(
     r"^(?P<name>[^\[\]()[:,]+)"  # dataset name
     r"(?:\[(?P<subset>[^\]]+)\])?"  # optional [subset]
     r"(?:\((?P<split>[^\)]+)\))?"  # optional (split)
-    r":(?P<num_samples>\d+)$"  # :num_samples (required for composite)
+    r":(?P<num_batches>\d+)$"  # :num_batches (required for composite)
 )
 
 
@@ -101,7 +134,7 @@ def parse_composite_dataset_spec(
     """Parse a composite dataset specification string.
 
     Returns a list of CompositeDatasetComponent if the spec is composite
-    (contains comma-separated entries with :num_samples), or None if the spec
+    (contains comma-separated entries with :num_batches), or None if the spec
     is a single dataset name (backward-compatible).
 
     Format: ``name1[subset1](split1):N1,name2:N2,name3[subset3]:N3,...``
@@ -137,7 +170,7 @@ def parse_composite_dataset_spec(
                 return None
             raise ValueError(
                 f"Failed to parse composite dataset component {i}: '{part}'. "
-                f"Expected format: <dataset_name>[<subset>](<split>):<num_samples>. "
+                f"Expected format: <dataset_name>[<subset>](<split>):<num_batches>. "
                 f"Full spec: '{spec}'"
             )
         name = m.group("name").strip()
@@ -147,13 +180,13 @@ def parse_composite_dataset_spec(
         split = m.group("split")
         if split is None:
             split = default_split
-        num_samples = int(m.group("num_samples"))
+        num_batches = int(m.group("num_batches"))
         components.append(
             CompositeDatasetComponent(
                 name=name,
                 split=split,
                 subset=subset,
-                num_samples=num_samples,
+                num_batches=num_batches,
             )
         )
 
@@ -166,7 +199,7 @@ def parse_composite_dataset_spec(
             f"{c.name}"
             f"{f'[{c.subset}]' if c.subset is not None else ''}"
             f"{f'({c.split})' if c.split is not None else ''}"
-            f":{c.num_samples}"
+            f":{c.num_batches}"
             for c in components
         )
     )
@@ -202,7 +235,7 @@ def load_category_batches(
     split_by_category,
     return_vllm_tokens_prompt,
     truncate,
-    samples_per_category,
+    batches_per_category,
 ):
     raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
@@ -226,7 +259,7 @@ def load_category_batches(
         batch_size=batch_size,
     )
     category_data_batches = processor.get_processed_dataset(
-        samples_per_category=samples_per_category,
+        batches_per_category=batches_per_category,
     )
     return category_data_batches
 
@@ -337,7 +370,7 @@ class BaseDatasetProcessor(ABC):
         )
 
     def get_processed_dataset(
-        self, samples_per_category: int
+        self, batches_per_category: int
     ) -> dict[str, list[TokensPrompt]] | dict[str, list[BatchEncoding]]:
         """Get requests for each category in the dataset."""
         if self._mapped_dataset is None:
@@ -349,13 +382,13 @@ class BaseDatasetProcessor(ABC):
                 else self.select_only_categories
             )
             return {
-                c: self._process_samples_for_category(c, samples_per_category)
+                c: self._process_samples_for_category(c, batches_per_category)
                 for c in categories
             }
         else:
             return {
                 self.all_categories_label: self._process_samples_for_category(
-                    self.all_categories_label, samples_per_category
+                    self.all_categories_label, batches_per_category
                 ),
             }
 
@@ -371,7 +404,7 @@ class BaseDatasetProcessor(ABC):
     def _process_samples_for_category(
         self,
         category: str,
-        samples_per_category: int,
+        batches_per_category: int,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         if category != self.all_categories_label:
             category_dataset = self._mapped_dataset.filter(
@@ -383,11 +416,11 @@ class BaseDatasetProcessor(ABC):
 
         if self.pack_samples:
             return self._process_samples_for_category_packed(
-                category, samples_per_category, category_dataset
+                category, batches_per_category, category_dataset
             )
         else:
             return self._process_samples_for_category_unpacked(
-                category, samples_per_category, category_dataset
+                category, batches_per_category, category_dataset
             )
 
     def _collate_batch(self, batch: list[dict[str, torch.Tensor]]) -> BatchEncoding:
@@ -445,17 +478,17 @@ class BaseDatasetProcessor(ABC):
     def _process_samples_for_category_unpacked(
         self,
         category: str,
-        samples_per_category: int,
+        batches_per_category: int,
         category_dataset: Dataset,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         processed_samples = []
         sampled = []  # sample without replacement
         current_batch = []
-        while len(processed_samples) < samples_per_category:
+        while len(processed_samples) < batches_per_category:
             if len(sampled) >= len(category_dataset):
                 logger.warning(
                     f"Not enough samples in category '{category}' to reach "
-                    f"{samples_per_category} samples. Only {len(sampled)} "
+                    f"{batches_per_category} data batches. Only {len(sampled)} "
                     "samples were processed.",
                 )
                 break
@@ -496,17 +529,17 @@ class BaseDatasetProcessor(ABC):
     def _process_samples_for_category_packed(
         self,
         category: str,
-        samples_per_category: int,
+        batches_per_category: int,
         category_dataset: Dataset,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         processed_samples = []
         sampled = []
         current_batch = []
-        while len(processed_samples) < samples_per_category:
+        while len(processed_samples) < batches_per_category:
             if len(sampled) >= len(category_dataset):
                 logger.warning(
                     f"Not enough samples in category '{category}' to reach "
-                    f"{samples_per_category} samples. Only {len(sampled)} "
+                    f"{batches_per_category} data batches. Only {len(sampled)} "
                     "samples were processed.",
                 )
                 break
@@ -557,10 +590,11 @@ class BaseDatasetProcessor(ABC):
 class ChatDatasetProcessor(BaseDatasetProcessor):
     def _encode_sample(self, sample: dict) -> torch.Tensor:
         chat_template_kwargs = {}
+        messages = _normalize_messages_for_chat_template(sample[self.messages_field])
         if self.tools_field in sample:
             chat_template_kwargs = {"tools": _maybe_json_load(sample[self.tools_field])}
         chat_sample = self.tokenizer.apply_chat_template(
-            sample[self.messages_field],
+            messages,
             add_generation_prompt=False,
             tokenize=False,
             **chat_template_kwargs,
@@ -578,12 +612,15 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
         def chat_template_fn(sample: dict[str, any]) -> dict[str, any]:
             """Apply chat template to the sample."""
             chat_template_kwargs = {}
+            messages = _normalize_messages_for_chat_template(
+                sample[self.messages_field]
+            )
             if self.tools_field in sample:
                 chat_template_kwargs = {
                     "tools": _maybe_json_load(sample[self.tools_field])
                 }
             chat_sample = self.tokenizer.apply_chat_template(
-                sample[self.messages_field],
+                messages,
                 add_generation_prompt=False,
                 tokenize=False,
                 **chat_template_kwargs,
