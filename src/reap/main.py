@@ -189,10 +189,14 @@ def record_activations(
     )
     if composite_components is not None:
         combined_batches = []
-        total_samples = sum(c.num_samples for c in composite_components)
+        total_batches = sum(c.num_batches for c in composite_components)
+        logger.info(
+            f"Composite dataset specified, overwriting given batches_per_category={obs_args.batches_per_category} "
+            f"with values in composite dataset spec."
+        )
         logger.info(
             f"Loading composite dataset with {len(composite_components)} "
-            f"components, {total_samples} total samples."
+            f"components, {total_batches} total data batches."
         )
 
         for comp_idx, component in enumerate(composite_components):
@@ -203,7 +207,7 @@ def record_activations(
             )
             logger.info(
                 f"[{comp_idx + 1}/{len(composite_components)}] Loading component: "
-                f"{comp_label} ({component.num_samples} samples)"
+                f"{comp_label} ({component.num_batches} batches)"
             )
             component_batches = load_category_batches(
                 dataset_name=component.name,
@@ -214,7 +218,7 @@ def record_activations(
                 split_by_category=False,
                 return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
                 truncate=obs_args.truncate,
-                samples_per_category=component.num_samples,
+                batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
             )
             combined_batches.extend(component_batches["all"])
@@ -230,7 +234,7 @@ def record_activations(
             split_by_category=obs_args.split_by_category,
             return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
             truncate=obs_args.truncate,
-            samples_per_category=obs_args.samples_per_category,
+            batches_per_category=obs_args.batches_per_category,
             batch_size=obs_args.batch_size,
         )
 
