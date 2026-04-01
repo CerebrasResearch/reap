@@ -82,8 +82,6 @@ def dump_args_to_yaml(
 def prune(
     observer_data,
     model,
-    tokenizer,
-    reap_args,
     prune_args,
     n_experts_to_prune,
     pruned_model_dir,
@@ -312,8 +310,6 @@ def main():
         prune(
             observer_data,
             model,
-            tokenizer,
-            reap_args,
             prune_args,
             n_experts_to_prune,
             pruned_model_dir,
