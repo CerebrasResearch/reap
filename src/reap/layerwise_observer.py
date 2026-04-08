@@ -415,8 +415,54 @@ class LayerwiseMoEObserver:
 
             raise ValueError(f"Unsupported batch type: {type(batch)}")
 
+        entry_signature = inspect.signature(entry_block.forward)
+        entry_param_names = [
+            name
+            for name, parameter in entry_signature.parameters.items()
+            if name != "self"
+            and parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+
         def intercept_entry_inputs(_, args, kwargs):
+            """Capture first-block inputs without assuming masks only arrive in kwargs.
+
+            ERNIE-style decoder layers may pass `attention_mask` and `position_ids`
+            positionally alongside non-tensor arguments, so we recover them by the
+            entry block's parameter names and only cache `hidden_states` as replay input.
+            """
             replay_kwargs = {}
+            attention_mask = kwargs.get("attention_mask")
+            position_ids = kwargs.get("position_ids")
+
+            replay_inputs: List[torch.Tensor] = []
+            for index, value in enumerate(args):
+                param_name = (
+                    entry_param_names[index] if index < len(entry_param_names) else None
+                )
+
+                if index == 0 or param_name == "hidden_states":
+                    if not torch.is_tensor(value):
+                        raise TypeError(
+                            "Expected first decoder block input hidden_states to be a tensor"
+                        )
+                    replay_inputs.append(value.detach().cpu())
+                    continue
+
+                if param_name == "attention_mask":
+                    attention_mask = value
+                    continue
+
+                if param_name == "position_ids":
+                    position_ids = value
+                    continue
+
+                if param_name is not None:
+                    replay_kwargs[param_name] = move_to_device(value, cpu_device)
+
             for key, value in kwargs.items():
                 if key in {"hidden_states", "attention_mask", "position_ids"}:
                     continue
@@ -424,15 +470,15 @@ class LayerwiseMoEObserver:
 
             captured_batches.append(
                 ReplayBatch(
-                    inputs=[tensor.detach().cpu() for tensor in args],
+                    inputs=replay_inputs,
                     kwargs=LayerwiseMoEObserver._sanitize_cached_block_kwargs(
                         replay_kwargs
                     ),
-                    attention_mask=kwargs["attention_mask"].detach().cpu()
-                    if kwargs.get("attention_mask") is not None
+                    attention_mask=attention_mask.detach().cpu()
+                    if torch.is_tensor(attention_mask)
                     else None,
-                    position_ids=kwargs["position_ids"].detach().cpu()
-                    if kwargs.get("position_ids") is not None
+                    position_ids=position_ids.detach().cpu()
+                    if torch.is_tensor(position_ids)
                     else None,
                 )
             )
@@ -592,7 +638,20 @@ class LayerwiseMoEObserver:
         activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
         def extract_router_logits(router_module, input):
-            result = router_module(input)
+            """Call routers that expect either flattened or sequence-shaped hidden states.
+
+            DeepSeek's gate unpacks `[batch, seq, hidden]` internally, while other
+            routers accept the flattened `[tokens, hidden]` view used for metric
+            collection. Retry with the original 3D shape when the flat call fails.
+            """
+            try:
+                result = router_module(input)
+            except (TypeError, ValueError):
+                if input.ndim != 2:
+                    raise
+                result = router_module(
+                    input.view(batch_size, sequence_length, hidden_dim)
+                )
             if isinstance(result, tuple):
                 *_, router_logits = result
             else:
