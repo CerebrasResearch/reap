@@ -663,6 +663,13 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class MiniMaxM2MoEObserverHookConfig(MoETransformerObserverConfig):
+    # Hooks onto MiniMaxM2SparseMoeBlock.
+    # MiniMaxM2Experts exposes .num_experts and .top_k, matching base class defaults.
+    module_class_name_to_hook_regex: Optional[str] = "MiniMaxM2SparseMoeBlock"
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
@@ -672,4 +679,5 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "MiniMaxM2ForCausalLM": MiniMaxM2MoEObserverHookConfig,
 }

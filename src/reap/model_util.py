@@ -115,6 +115,21 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "MiniMaxM2ForCausalLM": {
+        # MiniMaxM2MLP uses w1/w2/w3 instead of gate_proj/up_proj/down_proj.
+        # Confirmed against HF modeling_minimax_m2.py and SGLang minimax_m2.py
+        # (ckpt_gate_proj_name="w1", ckpt_down_proj_name="w2", ckpt_up_proj_name="w3").
+        # block_sparse_moe is the MoE attribute on MiniMaxM2DecoderLayer.
+        "moe_block": "block_sparse_moe",
+        "gate_proj": "w1",
+        "up_proj": "w3",
+        "down_proj": "w2",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "num_local_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
 }
 
 
