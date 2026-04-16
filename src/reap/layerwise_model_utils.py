@@ -68,23 +68,17 @@ def _iter_module_tensors(module: nn.Module):
 
 def safe_get_device(module: nn.Module) -> str:
     """Safely get the first non-meta device of a module."""
-    try:
-        for tensor in _iter_module_tensors(module):
-            device_str = str(tensor.device)
-            if device_str != "meta":
-                return device_str
-        return "meta"
-    except Exception:
-        raise
-
+    for tensor in _iter_module_tensors(module):
+        device_str = str(tensor.device)
+        if device_str != "meta":
+            return device_str
+    return "meta"
+    
 
 def has_meta_tensors(module: nn.Module) -> bool:
     """Check whether a module contains any meta tensors."""
-    try:
-        return any(str(tensor.device) == "meta" for tensor in _iter_module_tensors(module))
-    except Exception:
-        return False
-
+    return any(str(tensor.device) == "meta" for tensor in _iter_module_tensors(module))
+    
 
 def natural_sort_key(value: str) -> tuple[object, ...]:
     """Return a key that sorts strings with embedded numbers naturally.
@@ -169,7 +163,7 @@ def _matches_decoder_block_name(name: str) -> bool:
     return any(pattern.search(name) for pattern in DECODER_BLOCK_PATTERNS)
 
 
-def _has_projection_like_child(module: nn.Module) -> bool:
+def _has_linear_like_child(module: nn.Module) -> bool:
     return any(is_linear_like(child) for child in module.modules())
 
 
@@ -177,7 +171,7 @@ def is_decoder_block(name: str, module: nn.Module) -> bool:
     """
     Return True if the module looks like a transformer decoder block.
     """
-    return _matches_decoder_block_name(name) and _has_projection_like_child(module)
+    return _matches_decoder_block_name(name) and _has_linear_like_child(module)
 
 
 def get_module_by_name(model: nn.Module, module_name: str) -> Optional[nn.Module]:

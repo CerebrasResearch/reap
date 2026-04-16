@@ -515,7 +515,7 @@ class PruneArgs:
         default=False,
         metadata={
             "help": (
-                r"Whether to perserve super experts when pruning. Excludes last 25%% of layers"
+                "Whether to preserve super experts when pruning. Excludes last 25%% of layers"
             )
         }
     )
@@ -523,7 +523,7 @@ class PruneArgs:
         default=False,
         metadata={
             "help": (
-                "Whether to perserve outlier experts when pruning, includes all layers"
+                "Whether to preserve outlier experts when pruning, includes all layers"
             )
         }
     )
@@ -538,6 +538,7 @@ class LayerwiseArgs:
         metadata={
             "help": (
                 "Number of pre-tokenized calibration batches to process at a time. "
+                "If not set, process all the batches generated from the dataset. "
                 "If set, the layerwise observer processes one group through all blocks "
                 "before moving to the next group, which reduces CPU RAM usage from "
                 "cached first-layer inputs."

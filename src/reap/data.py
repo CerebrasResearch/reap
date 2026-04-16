@@ -382,12 +382,12 @@ class BaseDatasetProcessor(ABC):
                 else self.select_only_categories
             )
             return {
-                c: self._process_samples_for_category(c, batches_per_category)
+                c: self._process_batches_for_category(c, batches_per_category)
                 for c in categories
             }
         else:
             return {
-                self.all_categories_label: self._process_samples_for_category(
+                self.all_categories_label: self._process_batches_for_category(
                     self.all_categories_label, batches_per_category
                 ),
             }
@@ -401,7 +401,7 @@ class BaseDatasetProcessor(ABC):
             return ["all"]
         return self.dataset.unique(self.category_field)
 
-    def _process_samples_for_category(
+    def _process_batches_for_category(
         self,
         category: str,
         batches_per_category: int,
@@ -415,11 +415,11 @@ class BaseDatasetProcessor(ABC):
             category = self.all_categories_label
 
         if self.pack_samples:
-            return self._process_samples_for_category_packed(
+            return self._process_batches_for_category_packed(
                 category, batches_per_category, category_dataset
             )
         else:
-            return self._process_samples_for_category_unpacked(
+            return self._process_batches_for_category_unpacked(
                 category, batches_per_category, category_dataset
             )
 
@@ -475,7 +475,7 @@ class BaseDatasetProcessor(ABC):
             }
         )
 
-    def _process_samples_for_category_unpacked(
+    def _process_batches_for_category_unpacked(
         self,
         category: str,
         batches_per_category: int,
@@ -526,7 +526,7 @@ class BaseDatasetProcessor(ABC):
 
         return processed_samples
 
-    def _process_samples_for_category_packed(
+    def _process_batches_for_category_packed(
         self,
         category: str,
         batches_per_category: int,

@@ -10,17 +10,16 @@ compression_ratio=${5:-0.25}
 dataset_name=${6:-"theblackcat102/evol-codealpaca-v1"}
 
 artifact_dir_name() {
-    python - "$1" <<'PY'
-import hashlib
-import re
-import sys
+    local value=$1
+    local base hash
 
-value = sys.argv[1]
-if "," in value:
-    print(f"composite_{hashlib.md5(value.encode()).hexdigest()[:8]}")
-else:
-    print(re.sub(r"[^\w\-_.]", "_", value.split("/")[-1]))
-PY
+    if [[ $value == *,* ]]; then
+        hash=$(printf '%s' "$value" | md5sum)
+        printf 'composite_%.8s\n' "$hash"
+    else
+        base=${value##*/}
+        printf '%s\n' "${base//[^[:alnum:]_.-]/_}"
+    fi
 }
 
 # qa
@@ -88,6 +87,3 @@ bash experiments/eval.sh \
     ${run_math} \
     ${run_wildbench}
 echo "Finished evaluating model: ${model_dir}"
-
-# echo "Removing safetensor files from ${model_dir}"
-# rm ${model_dir}/*.safetensors
