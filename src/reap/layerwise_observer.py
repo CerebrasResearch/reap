@@ -637,6 +637,7 @@ class LayerwiseMoEObserver:
         # Compute activations for all experts
         activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
+        # TODO(ivanl): model-specific handling of router_module return signature
         def extract_router_logits(router_module, input):
             """Call routers that expect either flattened or sequence-shaped hidden states.
 

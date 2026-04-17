@@ -610,27 +610,10 @@ def get_model_dir(
 
 
 def dump_args_to_yaml(
-    merged_model_dir: pathlib.Path,
-    reap_args: ReapArgs,
-    model_args: ModelArgs,
-    ds_args: DatasetArgs,
-    obs_args: ObserverArgs,
-    cluster_args: ClusterArgs,
-    kd_args: KdArgs,
-    eval_args: EvalArgs,
-    merge_args: MergeArgs,
+    pruned_model_dir: pathlib.Path,
+    **all_args,
 ):
     """Dump all arguments to a YAML file."""
-    all_args = {
-        "reap_args": dataclasses.asdict(reap_args),
-        "model_args": dataclasses.asdict(model_args),
-        "ds_args": dataclasses.asdict(ds_args),
-        "obs_args": dataclasses.asdict(obs_args),
-        "cluster_args": dataclasses.asdict(cluster_args),
-        "kd_args": dataclasses.asdict(kd_args),
-        "eval_args": dataclasses.asdict(eval_args),
-        "merge_args": dataclasses.asdict(merge_args),
-    }
 
     def convert_paths_to_str(data):
         if isinstance(data, dict):
@@ -642,12 +625,17 @@ def dump_args_to_yaml(
         else:
             return data
 
-    serializable_args = convert_paths_to_str(all_args)
+    serializable_args = {}
+    for name, arg in all_args.items():
+        if dataclasses.is_dataclass(arg):
+            serializable_args[name] = convert_paths_to_str(dataclasses.asdict(arg))
+        else:
+            serializable_args[name] = convert_paths_to_str(arg)
 
-    output_path = merged_model_dir / "reap_args.yaml"
+    output_path = pruned_model_dir / "reap_args.yaml"
     with open(output_path, "w") as f:
         yaml.dump(serializable_args, f, default_flow_style=False)
-    logger.info(f"All arguments saved to {output_path}")
+    logger.info(f"Arguments saved to {output_path}")
 
 
 def main():

@@ -16,7 +16,7 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.main import record_activations, smoke_test, create_results_directory
+from reap.main import record_activations, smoke_test, create_results_directory, dump_args_to_yaml
 from reap.args import (
     ReapArgs,
     ModelArgs,
@@ -38,45 +38,6 @@ import shutil
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-def dump_args_to_yaml(
-    pruned_model_dir: pathlib.Path,
-    reap_args: ReapArgs,
-    ds_args: DatasetArgs,
-    obs_args: ObserverArgs,
-    model_args: ModelArgs,
-    eval_args: EvalArgs,
-    prune_args: PruneArgs,
-    cluster_args: ClusterArgs,
-):
-    """Dump all arguments to a YAML file."""
-    all_args = {
-        "reap_args": dataclasses.asdict(reap_args),
-        "ds_args": dataclasses.asdict(ds_args),
-        "obs_args": dataclasses.asdict(obs_args),
-        "model_args": dataclasses.asdict(model_args),
-        "eval_args": dataclasses.asdict(eval_args),
-        "prune_args": dataclasses.asdict(prune_args),
-        "cluster_args": dataclasses.asdict(cluster_args),
-    }
-
-    def convert_paths_to_str(data):
-        if isinstance(data, dict):
-            return {k: convert_paths_to_str(v) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [convert_paths_to_str(i) for i in data]
-        elif isinstance(data, pathlib.Path):
-            return str(data)
-        else:
-            return data
-
-    serializable_args = convert_paths_to_str(all_args)
-
-    output_path = pruned_model_dir / "reap_args.yaml"
-    with open(output_path, "w") as f:
-        yaml.dump(serializable_args, f, default_flow_style=False)
-    logger.info(f"All arguments saved to {output_path}")
 
 
 def prune(
@@ -205,22 +166,31 @@ def prune(
 
 
 def get_pruned_model_dir(
-    results_dir,
-    n_experts_to_prune: str,
+    results_dir: pathlib.Path,
+    n_experts_to_prune: int,
     total_experts: int,
-    prune_args,
+    prune_args: PruneArgs,
     seed: int,
+    renorm: bool,
+    name_prefix: str = None,
 ) -> pathlib.Path:
+    """Generate output directory path for pruned model."""
     compression_ratio_str = f"{(n_experts_to_prune / total_experts):.2f}"
-    pruned_model_name = f"{prune_args.prune_method}"
+    name_prefix = "" if name_prefix is None else name_prefix
+    pruned_model_name = f"{name_prefix}{prune_args.prune_method}"
+
     if prune_args.perserve_super_experts:
         pruned_model_name += "-perserve_super"
     elif prune_args.perserve_outliers:
         pruned_model_name += "-perserve_outlier"
+    if renorm:
+        pruned_model_name += f"-renorm_{str(renorm).lower()}"
     pruned_model_name += f"-seed_{seed}"
     pruned_model_name += f"-{compression_ratio_str}"
+
     pruned_model_dir = results_dir / "pruned_models" / pruned_model_name
     logger.info(f"Using seed {seed}, pruned model dir: {pruned_model_dir}")
+
     return pruned_model_dir
 
 
@@ -294,7 +264,7 @@ def main():
             )
 
     pruned_model_dir = get_pruned_model_dir(
-        results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed
+        results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed, obs_args.renormalize_router_weights
     )
     if (
         pruned_model_dir.exists()

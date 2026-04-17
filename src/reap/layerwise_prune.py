@@ -50,40 +50,11 @@ from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
 from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
+from reap.prune import get_pruned_model_dir
+from reap.main import dump_args_to_yaml, create_results_directory
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path:
-    """Create a clean directory name from model and dataset names."""
-    import re
-
-    def str_to_directory_name(s: str) -> str:
-        return re.sub(r"[^\w\-_.]", "_", s)
-
-    model_clean = model_name.split("/")[-1]
-    model_clean = str_to_directory_name(model_clean)
-
-    if "," in dataset_name:
-        spec_hash = hashlib.md5(dataset_name.encode()).hexdigest()[:8]
-        dataset_clean = f"composite_{spec_hash}"
-        logger.info(
-            f"Composite dataset spec detected. Using directory name: {dataset_clean}"
-        )
-    else:
-        dataset_clean = dataset_name.split("/")[-1]
-        dataset_clean = str_to_directory_name(dataset_clean)
-
-    results_dir = pathlib.Path("./artifacts") / model_clean / dataset_clean
-
-    if results_dir.exists():
-        logger.warning(f"Directory '{results_dir}' already exists")
-    else:
-        results_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Created artifacts directory: {results_dir}")
-
-    return results_dir
 
 
 def _get_observer_output_path(
@@ -241,62 +212,6 @@ def record_activations_layerwise(
     return observer_data
 
 
-def get_pruned_model_dir(
-    results_dir: pathlib.Path,
-    n_experts_to_prune: int,
-    total_experts: int,
-    prune_args: PruneArgs,
-    seed: int,
-    renorm: bool,
-) -> pathlib.Path:
-    """Generate output directory path for pruned model."""
-    compression_ratio_str = f"{(n_experts_to_prune / total_experts):.2f}"
-    pruned_model_name = f"layerwise_{prune_args.prune_method}"
-
-    if prune_args.perserve_super_experts:
-        pruned_model_name += "-perserve_super"
-    elif prune_args.perserve_outliers:
-        pruned_model_name += "-perserve_outlier"
-    if renorm:
-        pruned_model_name += f"-renorm_{str(renorm).lower()}"
-    pruned_model_name += f"-seed_{seed}"
-    pruned_model_name += f"-{compression_ratio_str}"
-
-    pruned_model_dir = results_dir / "pruned_models" / pruned_model_name
-    logger.info(f"Using seed {seed}, pruned model dir: {pruned_model_dir}")
-
-    return pruned_model_dir
-
-
-def dump_args_to_yaml(
-    pruned_model_dir: pathlib.Path,
-    **all_args,
-):
-    """Dump all arguments to a YAML file."""
-
-    def convert_paths_to_str(data):
-        if isinstance(data, dict):
-            return {k: convert_paths_to_str(v) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [convert_paths_to_str(i) for i in data]
-        elif isinstance(data, pathlib.Path):
-            return str(data)
-        else:
-            return data
-
-    serializable_args = {}
-    for name, arg in all_args.items():
-        if dataclasses.is_dataclass(arg):
-            serializable_args[name] = convert_paths_to_str(dataclasses.asdict(arg))
-        else:
-            serializable_args[name] = convert_paths_to_str(arg)
-
-    output_path = pruned_model_dir / "reap_layerwise_args.yaml"
-    with open(output_path, "w") as f:
-        yaml.dump(serializable_args, f, default_flow_style=False)
-    logger.info(f"Arguments saved to {output_path}")
-
-
 def main():
     parser = HfArgumentParser(
         (
@@ -426,6 +341,7 @@ def main():
         prune_args,
         reap_args.seed,
         obs_args.renormalize_router_weights,
+        name_prefix="layerwise_",
     )
 
     # Check if already pruned
@@ -497,5 +413,6 @@ def main():
         )
 
 
+# TODO(ivanl): unify with prune.py entrypoint
 if __name__ == "__main__":
     main()
