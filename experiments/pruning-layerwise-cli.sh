@@ -10,17 +10,16 @@ compression_ratio=${5:-0.25}
 dataset_name=${6:-"theblackcat102/evol-codealpaca-v1"}
 
 artifact_dir_name() {
-    python - "$1" <<'PY'
-import hashlib
-import re
-import sys
+    local value=$1
+    local base hash
 
-value = sys.argv[1]
-if "," in value:
-    print(f"composite_{hashlib.md5(value.encode()).hexdigest()[:8]}")
-else:
-    print(re.sub(r"[^\w\-_.]", "_", value.split("/")[-1]))
-PY
+    if [[ $value == *,* ]]; then
+        hash=$(printf '%s' "$value" | md5sum)
+        printf 'composite_%.8s\n' "$hash"
+    else
+        base=${value##*/}
+        printf '%s\n' "${base//[^[:alnum:]_.-]/_}"
+    fi
 }
 
 # qa
@@ -34,8 +33,8 @@ run_math=${10:-false}
 run_wildbench=${11:-false}
 singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
-batch_size=1
-num_batches=1024
+num_batches=128
+batch_size=8
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
@@ -47,7 +46,7 @@ echo "Evaluations: lm_eval: $run_lm_eval, evalplus: $run_evalplus, livecodebench
 echo "Using seed: $seed"
 
 echo "Running with model: $model_name, dataset: $dataset_name, compression ratio: $compression_ratio, pruning method: $pruning_method"
-python src/reap/prune.py \
+python -m reap.layerwise_prune \
     --model-name $model_name \
     --dataset-name $dataset_name \
     --compression-ratio $compression_ratio \
@@ -56,24 +55,22 @@ python src/reap/prune.py \
     --vllm_port $port \
     --server-log-file-name $server_log_file_name \
     --do-eval false \
-    --distance_measure cosine \
     --seed $seed \
     --output_file_name ${output_file_name} \
-    --singleton_super_experts ${singleton_super_experts} \
-    --singleton_outlier_experts ${singleton_outlier_experts} \
-    --batch_size ${batch_size} \
     --batches_per_category ${num_batches} \
-    --record_pruning_metrics_only true
+    --batch_size ${batch_size} \
+    --low_cpu_mem_usage True
 
 short_model_name=$(artifact_dir_name "$model_name")
 short_dataset_name=$(artifact_dir_name "$dataset_name")
 
-pruned_model_dir_name="${pruning_method}"
+pruned_model_dir_name="layerwise_${pruning_method}"
 if [[ "${singleton_super_experts}" == "true" ]]; then
     pruned_model_dir_name="${pruned_model_dir_name}-perserve_super"
 elif [[ "${singleton_outlier_experts}" == "true" ]]; then
     pruned_model_dir_name="${pruned_model_dir_name}-perserve_outlier"
 fi
+pruned_model_dir_name="${pruned_model_dir_name}-renorm_true"
 pruned_model_dir_name="${pruned_model_dir_name}-seed_${seed}-${compression_ratio}"
 
 model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruned_model_dir_name}"
@@ -89,7 +86,4 @@ bash experiments/eval.sh \
     ${run_livecodebench} \
     ${run_math} \
     ${run_wildbench}
-echo "Finished evaluating model: ${pruned_model}"
-
-# echo "Removing safetensor files from ${model_dir}"
-# rm ${model_dir}/*.safetensors
+echo "Finished evaluating model: ${model_dir}"

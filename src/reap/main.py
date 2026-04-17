@@ -189,10 +189,14 @@ def record_activations(
     )
     if composite_components is not None:
         combined_batches = []
-        total_samples = sum(c.num_samples for c in composite_components)
+        total_batches = sum(c.num_batches for c in composite_components)
+        logger.info(
+            f"Composite dataset specified, overwriting given batches_per_category={obs_args.batches_per_category} "
+            f"with values in composite dataset spec."
+        )
         logger.info(
             f"Loading composite dataset with {len(composite_components)} "
-            f"components, {total_samples} total samples."
+            f"components, {total_batches} total data batches."
         )
 
         for comp_idx, component in enumerate(composite_components):
@@ -203,7 +207,7 @@ def record_activations(
             )
             logger.info(
                 f"[{comp_idx + 1}/{len(composite_components)}] Loading component: "
-                f"{comp_label} ({component.num_samples} samples)"
+                f"{comp_label} ({component.num_batches} batches)"
             )
             component_batches = load_category_batches(
                 dataset_name=component.name,
@@ -214,7 +218,7 @@ def record_activations(
                 split_by_category=False,
                 return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
                 truncate=obs_args.truncate,
-                samples_per_category=component.num_samples,
+                batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
             )
             combined_batches.extend(component_batches["all"])
@@ -230,7 +234,7 @@ def record_activations(
             split_by_category=obs_args.split_by_category,
             return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
             truncate=obs_args.truncate,
-            samples_per_category=obs_args.samples_per_category,
+            batches_per_category=obs_args.batches_per_category,
             batch_size=obs_args.batch_size,
         )
 
@@ -606,27 +610,10 @@ def get_model_dir(
 
 
 def dump_args_to_yaml(
-    merged_model_dir: pathlib.Path,
-    reap_args: ReapArgs,
-    model_args: ModelArgs,
-    ds_args: DatasetArgs,
-    obs_args: ObserverArgs,
-    cluster_args: ClusterArgs,
-    kd_args: KdArgs,
-    eval_args: EvalArgs,
-    merge_args: MergeArgs,
+    pruned_model_dir: pathlib.Path,
+    **all_args,
 ):
     """Dump all arguments to a YAML file."""
-    all_args = {
-        "reap_args": dataclasses.asdict(reap_args),
-        "model_args": dataclasses.asdict(model_args),
-        "ds_args": dataclasses.asdict(ds_args),
-        "obs_args": dataclasses.asdict(obs_args),
-        "cluster_args": dataclasses.asdict(cluster_args),
-        "kd_args": dataclasses.asdict(kd_args),
-        "eval_args": dataclasses.asdict(eval_args),
-        "merge_args": dataclasses.asdict(merge_args),
-    }
 
     def convert_paths_to_str(data):
         if isinstance(data, dict):
@@ -638,12 +625,17 @@ def dump_args_to_yaml(
         else:
             return data
 
-    serializable_args = convert_paths_to_str(all_args)
+    serializable_args = {}
+    for name, arg in all_args.items():
+        if dataclasses.is_dataclass(arg):
+            serializable_args[name] = convert_paths_to_str(dataclasses.asdict(arg))
+        else:
+            serializable_args[name] = convert_paths_to_str(arg)
 
-    output_path = merged_model_dir / "reap_args.yaml"
+    output_path = pruned_model_dir / "reap_args.yaml"
     with open(output_path, "w") as f:
         yaml.dump(serializable_args, f, default_flow_style=False)
-    logger.info(f"All arguments saved to {output_path}")
+    logger.info(f"Arguments saved to {output_path}")
 
 
 def main():
