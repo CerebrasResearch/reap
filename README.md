@@ -78,7 +78,42 @@ Add model attribute names to `MODEL_ATTRS` in `src/reap/model_util.py`. Each ent
 - `fused`: If true, the model uses a FusedMoE layer. Of the currently supported models, only Llama-4 is fused. 
 - `router`: Attribute name of the router/gate layer in the SMoE module. 
 - `num_experts`: The key in the huggingface config containing the number of experts per layer. (ie., `num_experts` if `model.config.num_experts` contains this value)
-- `num_experts_per_tok`: The key in the huggingface config containing the number of experts activated per token. 
+- `num_experts_per_tok`: The key in the huggingface config containing the number of experts activated per token.
+- `model_root` (optional, default `model`): Attribute on the top-level `nn.Module` that holds the decoder block list. Most HF MoEs hang their decoder under `model.model`; hybrid backbones such as Nemotron-H hang it under `model.backbone`.
+
+### Nemotron-3 / Nemotron-H
+
+Nemotron-3 Nano is a hybrid Mamba-2 / GQA / MoE backbone. The upstream HF
+modeling file (a) hard-imports a Triton kernel from `mamba_ssm`, (b) wraps work
+in `torch.cuda.stream`, and (c) returns only the combined hidden states from
+`NemotronHMOE.forward` (no `router_logits` tuple). To make it work with the
+standard `MoETransformerObserver`, snapshot the model and overwrite
+`modeling_nemotron_h.py` with the patched copy in `src/reap/models/`:
+
+```bash
+python scripts/patch_nemotron_h.py
+```
+
+The patched file adds a pure-torch `rmsnorm_fn` fallback, guards
+`torch.cuda.stream` for non-CUDA inputs, and exposes router logits from the
+MoE forward. After patching, run pruning the same way as any other model:
+
+```bash
+bash experiments/pruning-cli.sh 0 nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 reap 42 0.25 theblackcat102/evol-codealpaca-v1 true true true false false
+```
+
+#### AMD ROCm / Strix Halo
+
+For AMD's Ryzen AI MAX+ 395 ("Strix Halo", gfx1151 iGPU) with 128 GB unified
+memory, install TheRock's nightly PyTorch wheels first — stock ROCm 6.4 wheels
+crash with `HIP error: no kernel image is available`:
+
+```bash
+pip install --pre torch --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
+```
+
+Both Nemotron-H patches above (rmsnorm, cuda.stream) are needed even on CUDA
+hosts that don't have `mamba-ssm` installed.
 
 
 ## Reproducing Experiments

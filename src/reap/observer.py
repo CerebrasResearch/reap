@@ -524,6 +524,17 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class NemotronHMoEObserverHookConfig(MoETransformerObserverConfig):
+    # Nemotron-3 / Nemotron-H. NemotronHMOE.forward must return
+    # (hidden_states, router_logits); see src/reap/models/modeling_nemotron_h.py
+    # for the patched modeling code.
+    module_class_name_to_hook_regex: Optional[str] = "NemotronHMOE"
+    num_experts_attr_name: str = "config.n_routed_experts"
+    top_k_attr_name: str = "config.num_experts_per_tok"
+    fused_experts: bool = False
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
@@ -533,4 +544,5 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "NemotronHForCausalLM": NemotronHMoEObserverHookConfig,
 }

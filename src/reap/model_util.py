@@ -115,12 +115,34 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "NemotronHForCausalLM": {
+        # Nemotron-3 / Nemotron-H is a hybrid Mamba-2 + GQA + MoE backbone.
+        # Each NemotronHBlock has a single `mixer` whose class varies by block
+        # type ("mamba" / "attention" / "mlp" / "moe"). The MoE blocks expose
+        # routed experts as a ModuleList named `experts` and a router named
+        # `gate`. The top-level wrapper is `model.backbone`, not `model.model`.
+        "moe_block": "mixer",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+        "model_root": "backbone",
+    },
 }
 
 
 def get_moe(model, layer):
-    moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    moe_attr_name = attrs["moe_block"]
+    # Most HF MoEs hang their decoder under model.model; Nemotron-H (and similar
+    # hybrid backbones) hang it under model.backbone. Walk the configured root.
+    root_attr = attrs.get("model_root", "model")
+    root = getattr(model, root_attr)
+    return getattr(root.layers[layer], moe_attr_name)
 
 
 def assert_merge(model, merged_moe, cluster_label):
@@ -193,6 +215,16 @@ def patched_model_map(model: str):
     if model == "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8":
         patched = True
         model_name = "artifacts/models/Qwen3-Coder-480B-A35B-Instruct-FP8"
+
+    # Nemotron-3 / Nemotron-H: the upstream HF modeling file (a) hard-imports a
+    # Triton kernel from mamba_ssm and a CUDA-only torch.cuda.stream call, and
+    # (b) returns only the combined hidden states from NemotronHMOE.forward,
+    # which breaks the REAP observer's `*_, router_logits = output` contract.
+    # The patched copy in src/reap/models/modeling_nemotron_h.py adds a pure-torch
+    # rmsnorm fallback, a CPU-safe stream context, and exposes router_logits.
+    if model == "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
+        patched = True
+        model_name = "artifacts/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
     if patched:
         logger.info(f"Using patched model for {model} from: {model_name}")
