@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers.tokenization_utils_base import BatchEncoding
+from transformers.masking_utils import create_causal_mask
 
 from reap.observer import (
     MoETransformerObserverConfig,
@@ -39,6 +40,7 @@ from reap.layerwise_model_utils import (
 )
 from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 from reap.metrics import OnlineStatsTracker
+from reap.disk_stream_util import SafetensorsIndex, materialize_module, free_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,6 +58,15 @@ class ReplayBatch:
     kwargs: Dict[str, Any]
     attention_mask: Optional[torch.Tensor] = None
     position_ids: Optional[torch.Tensor] = None
+    # Local addition: hybrid-attention models (e.g. Qwen3.5's mix of
+    # linear_attention/full_attention layers) compute a *different* mask per layer
+    # type -- `attention_mask` above is whatever mask block 0's own layer_type
+    # received (e.g. the raw/linear mask if block 0 is linear_attention), which is
+    # wrong to replay verbatim into a later full_attention block. `causal_mask` is
+    # the properly-constructed causal mask for full_attention layers, computed once
+    # alongside the rest of block 0's captured inputs; the right one is selected per
+    # block by layer_type at replay time (see _forward_block).
+    causal_mask: Optional[torch.Tensor] = None
 
 
 class ReplayCache:
@@ -73,6 +84,7 @@ class ReplayCache:
         kwargs: Dict[str, Any],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
     ) -> None:
         self._batches.append(
             ReplayBatch(
@@ -80,6 +92,7 @@ class ReplayCache:
                 kwargs=kwargs,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                causal_mask=causal_mask,
             )
         )
 
@@ -110,6 +123,12 @@ class ReplayCache:
         if batch.position_ids is not None:
             replay_kwargs["position_ids"] = move_to_device(
                 batch.position_ids, target_device
+            )
+        if batch.causal_mask is not None:
+            # Internal-only key, consumed and stripped in _forward_block's per-block
+            # mask selection -- never passed to a block's forward directly.
+            replay_kwargs["_causal_mask"] = move_to_device(
+                batch.causal_mask, target_device
             )
 
         return replay_inputs, replay_kwargs
@@ -158,6 +177,7 @@ class LayerwiseMoEObserver:
         model: nn.Module,
         hook_config: MoETransformerObserverConfig,
         block_names: Optional[List[str]] = None,
+        disk_index: Optional[SafetensorsIndex] = None,
     ):
         """
         Initialize the layerwise (blockwise) MoE observer.
@@ -166,9 +186,17 @@ class LayerwiseMoEObserver:
             model: The PyTorch MoE model to observe
             hook_config: Configuration for hooks (contains MoE-specific settings)
             block_names: List of transformer block names. Auto-detected if None.
+            disk_index: Local addition. When given, blocks with meta-device
+                parameters (i.e. the model was constructed with
+                accelerate.init_empty_weights() rather than fully materialized via
+                device_map="cpu") are streamed in from the checkpoint's safetensors
+                shards on demand -- materialized right before their forward and
+                released back to meta right after -- instead of requiring the whole
+                model resident in RAM up front. See disk_stream_util.py.
         """
         self.model = model
         self.hook_config = hook_config
+        self.disk_index = disk_index
         self._memory_cleanup_freq = 4
 
         # Auto-detect decoder blocks if not provided
@@ -190,6 +218,19 @@ class LayerwiseMoEObserver:
 
         # State dictionary to store metrics per block
         self.state: Dict[int, Dict[str, Any]] = {}
+
+        # Local addition: for models with an MTP (multi-token-prediction) head that
+        # reuses the main model's global expert count, the MTP layer needs its own
+        # saliency pass fed with real final-hidden-state / mask / position inputs.
+        # Rather than re-deriving those (RoPE, causal mask, etc.) by hand, capture
+        # exactly what the *last* main block actually received and produced -- since
+        # MTP's decoder layer has the same layer_type ("full_attention") and config
+        # as the model's own last full_attention block, this is directly reusable.
+        # Populated by _forward_block for block_idx == len(self.blocks) - 1 only;
+        # consumed by reap.mtp_util after record_all_blocks() completes and before
+        # replay_cache.clear() would otherwise discard it.
+        self.final_hidden_states: List[torch.Tensor] = []
+        self.final_block_kwargs: List[Dict[str, Any]] = []
 
         # MoE module cache per block
         self._moe_modules_cache: Dict[int, Optional[nn.Module]] = {}
@@ -249,6 +290,18 @@ class LayerwiseMoEObserver:
         """
         try:
             if has_meta_tensors(block):
+                if self.disk_index is not None and device != "meta":
+                    # Local addition: this block was constructed on the meta
+                    # device (init_empty_weights) rather than fully materialized
+                    # via device_map="cpu" -- stream its real tensors in from the
+                    # checkpoint directly onto the target device.
+                    materialize_module(
+                        block, self.block_names[block_idx], self.disk_index, device
+                    )
+                    logger.debug(
+                        "Materialized block %s from disk onto %s", block_idx, device
+                    )
+                    return safe_get_device(block)
                 logger.debug(
                     "Block %s has meta tensors, skipping move to %s",
                     block_idx,
@@ -294,16 +347,20 @@ class LayerwiseMoEObserver:
         return final_device
 
     def _offload_current_block(self) -> None:
-        """Offload the current block to CPU and release memory."""
+        """Offload the current block to CPU and release memory. When disk-streaming
+        (see disk_index), offloads all the way to meta instead of cpu, so the real
+        tensors are actually freed rather than accumulating in system RAM -- the
+        block gets re-materialized from disk next time it's needed."""
         block_idx = self.currently_loaded_block_idx
         if block_idx < 0:
             return
 
         block = self._block_at(block_idx)
+        offload_device = "meta" if self.disk_index is not None else "cpu"
 
         try:
             if block is not None:
-                self._move_block(block, block_idx, "cpu")
+                self._move_block(block, block_idx, offload_device)
         finally:
             self.currently_loaded_block_idx = -1
             cleanup_memory(synchronize=False)
@@ -468,6 +525,26 @@ class LayerwiseMoEObserver:
                     continue
                 replay_kwargs[key] = move_to_device(value, cpu_device)
 
+            # Local addition: hybrid-attention models (Qwen3.5) compute a separate
+            # causal mask for full_attention layers, distinct from whatever mask
+            # block 0 (possibly a linear_attention layer) received above. Compute it
+            # the same way the real model forward does, so later full_attention
+            # blocks get the right mask at replay time instead of block 0's.
+            causal_mask = None
+            hidden_states_value = args[0] if args else kwargs.get("hidden_states")
+            if torch.is_tensor(hidden_states_value):
+                try:
+                    text_config = LayerwiseMoEObserver._resolve_text_config(self.model)
+                    causal_mask = create_causal_mask(
+                        config=text_config,
+                        inputs_embeds=hidden_states_value,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        position_ids=position_ids,
+                    )
+                except Exception as exc:
+                    logger.debug("Could not precompute a causal_mask for replay: %s", exc)
+
             captured_batches.append(
                 ReplayBatch(
                     inputs=replay_inputs,
@@ -479,6 +556,9 @@ class LayerwiseMoEObserver:
                     else None,
                     position_ids=position_ids.detach().cpu()
                     if torch.is_tensor(position_ids)
+                    else None,
+                    causal_mask=causal_mask.detach().cpu()
+                    if torch.is_tensor(causal_mask)
                     else None,
                 )
             )
@@ -505,6 +585,7 @@ class LayerwiseMoEObserver:
                 kwargs=batch.kwargs,
                 attention_mask=batch.attention_mask,
                 position_ids=batch.position_ids,
+                causal_mask=batch.causal_mask,
             )
 
         logger.info("Prepared replay cache for %s batches", len(self.replay_cache))
@@ -521,6 +602,15 @@ class LayerwiseMoEObserver:
                 continue
             sanitized[key] = value
         return sanitized
+
+    @staticmethod
+    def _resolve_text_config(model: nn.Module):
+        """Local addition: find the text-only config a decoder layer's masking
+        logic was built against, for models where the top-level config wraps a
+        separate text_config (e.g. multimodal Qwen3.5 wrappers)."""
+        inner = getattr(model, "model", model)
+        text_module = getattr(inner, "language_model", inner)
+        return getattr(text_module, "config", model.config)
 
     def _get_forward_signature_info(self, block_idx: int) -> Tuple[set[str], bool]:
         """Return accepted forward kwargs and whether the block accepts **kwargs."""
@@ -660,8 +750,24 @@ class LayerwiseMoEObserver:
             return router_logits
 
         if self.hook_config.fused_experts:
-            # Fused experts (e.g., Llama-4)
-            router_logits = extract_router_logits(moe_module.router, flat_input)
+            # Fused experts (e.g., Llama-4, Qwen3.5).
+            # Local addition: Qwen3.5's router (`gate`) returns
+            # (router_logits, router_scores, router_indices) -- logits *first*,
+            # unlike REAP's generic extract_router_logits(), which assumes the
+            # logits are the *last* element of a returned tuple. Normalize via a
+            # thin wrapper instead of touching that shared helper (other models
+            # rely on its convention).
+            router_module = getattr(moe_module, "router", None)
+            if router_module is None and hasattr(moe_module, "gate"):
+                gate_module = moe_module.gate
+
+                def router_module(x):
+                    result = gate_module(x)
+                    return result[0] if isinstance(result, tuple) else result
+            if router_module is None:
+                raise ValueError(f"Cannot find router in MoE module at block {block_idx}")
+
+            router_logits = extract_router_logits(router_module, flat_input)
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
             selected_experts = selected_experts.to(device)
 
@@ -676,8 +782,26 @@ class LayerwiseMoEObserver:
                 dim=0,
                 index=router_indices,
             ).to(device)
-            routed_out = moe_module.experts(routed_in)
-            activations = routed_out.view(num_experts, *flat_input.shape)
+            try:
+                # Llama4-style fused experts: forward(hidden_states) accepts an
+                # (num_experts * tokens, hidden) tensor directly.
+                routed_out = moe_module.experts(routed_in)
+                activations = routed_out.view(num_experts, *flat_input.shape)
+            except TypeError:
+                # Qwen3.5-style fused experts (Qwen3_5MoeExperts.forward requires
+                # top_k_index/top_k_weights for sparse dispatch -- no dense
+                # all-experts-all-tokens calling convention exists). Compute the
+                # dense (num_experts, tokens, hidden) activations directly from the
+                # raw fused weight tensors instead.
+                experts_module = moe_module.experts
+                gate_up = torch.einsum(
+                    "th,eoh->eto", flat_input, experts_module.gate_up_proj
+                )
+                gate, up = gate_up.chunk(2, dim=-1)
+                hidden = experts_module.act_fn(gate) * up
+                activations = torch.einsum(
+                    "eti,eoi->eto", hidden, experts_module.down_proj
+                )
         else:
             # Loop-based MoE execution
             # First, we need to get router logits by doing a forward pass
@@ -760,6 +884,14 @@ class LayerwiseMoEObserver:
                     batch_idx=batch_idx,
                     target_device=target_device,
                 )
+                # Local addition: hybrid-attention models need a different mask per
+                # layer type (see ReplayBatch.causal_mask) -- swap in the properly
+                # computed causal mask for full_attention blocks; leave whatever
+                # mask was captured (e.g. the raw/linear mask) for everything else.
+                causal_mask = block_kwargs.pop("_causal_mask", None)
+                if causal_mask is not None and getattr(block, "layer_type", None) == "full_attention":
+                    block_kwargs["attention_mask"] = causal_mask
+
                 attention_mask = block_kwargs.get("attention_mask", None)
 
                 block_kwargs = self._build_replay_kwargs(block_idx, block_kwargs)
@@ -776,6 +908,19 @@ class LayerwiseMoEObserver:
 
                 if after_forward is not None:
                     after_forward(target_device, attention_mask)
+
+                # Local addition: this is the model's actual last block -- stash its
+                # real inputs/output (moved to CPU) for a possible later MTP saliency
+                # pass. See the final_hidden_states/final_block_kwargs docstring in
+                # __init__ for why this reuse is architecturally valid.
+                if block_idx == len(self.blocks) - 1:
+                    self.final_hidden_states.append(hidden_states.detach().cpu())
+                    self.final_block_kwargs.append(
+                        {
+                            key: move_to_device(value, torch.device("cpu"))
+                            for key, value in block_kwargs.items()
+                        }
+                    )
 
                 block_outputs.append([hidden_states.detach().cpu()])
 
