@@ -101,6 +101,18 @@ def _load_model_for_layerwise_processing(model_name: str, layerwise_args: "Layer
 
     disk_index = SafetensorsIndex(model_name)
 
+    # Local addition: transformers >=5.10 dispatches the fused-experts forward
+    # to torch._grouped_mm when available, whose meta registration hard-requires
+    # BF16 inputs -- but this layerwise replay runs in float32 (RoPE cos/sin
+    # promote hidden states through the chain). Force the eager per-expert
+    # loop, which is dtype-agnostic; observer throughput is dominated by disk
+    # streaming, not the expert matmul dispatch.
+    for cfg_obj in (model.config, getattr(model.config, "get_text_config", lambda: model.config)()):
+        try:
+            cfg_obj._experts_implementation = "eager"
+        except Exception:
+            pass
+
     text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
     embed_prefix = (
         "model.language_model.embed_tokens"
