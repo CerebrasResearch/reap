@@ -115,12 +115,33 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    # Local addition: not yet in upstream REAP. Qwen3_5MoeExperts stores experts as
+    # fused 3D parameter tensors (gate_up_proj, down_proj), same shape as Llama4's
+    # fused MoE layer above -- reuses that code path via fused=True. shared_expert is
+    # a separate always-on MLP outside this registry and is untouched by pruning.
+    "Qwen3_5MoeForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
 }
 
 
 def get_moe(model, layer):
     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    # Local addition: Qwen3_5MoeForConditionalGeneration nests decoder layers one
+    # level deeper (model.model.language_model.layers) than the causal-LM-only
+    # classes this originally targeted (model.model.layers).
+    decoder = model.model
+    if hasattr(decoder, "language_model"):
+        decoder = decoder.language_model
+    return getattr(decoder.layers[layer], moe_attr_name)
 
 
 def assert_merge(model, merged_moe, cluster_label):
