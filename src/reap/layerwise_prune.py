@@ -28,8 +28,12 @@ import hashlib
 from typing import Any, Dict, List
 import yaml
 
+import pathlib as _pathlib
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+import transformers
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from accelerate import init_empty_weights
 
 from accelerate.utils import set_seed
 
@@ -48,10 +52,84 @@ from reap.model_util import patched_model_map
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
+from reap.disk_stream_util import SafetensorsIndex, materialize_module
 from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
 from reap.main import dump_args_to_yaml, create_results_directory
+
+
+def _is_local_checkpoint_dir(model_name: str) -> bool:
+    """Local addition: True when model_name is a local directory with a safetensors
+    checkpoint on disk (our disk-streaming path applies here), as opposed to a
+    HuggingFace Hub model id (where the original device_map="cpu" full-RAM load is
+    kept, since REAP's other supported models are small enough for that to be fine)."""
+    path = _pathlib.Path(model_name)
+    return path.is_dir() and (
+        (path / "model.safetensors.index.json").exists()
+        or (path / "model.safetensors").exists()
+    )
+
+
+def _load_model_for_layerwise_processing(model_name: str, layerwise_args: "LayerwiseArgs"):
+    """Local addition: for local checkpoints, build the model on the meta device
+    (accelerate.init_empty_weights(), ~0 RAM) and materialize only the embedding
+    table for real, instead of device_map="cpu" (which materializes the *entire*
+    checkpoint in RAM -- infeasible for models much larger than available RAM+VRAM
+    combined). Each decoder block's real weights are streamed in from disk on
+    demand by LayerwiseMoEObserver (see disk_stream_util.py), one block at a time.
+    Returns (model, disk_index_or_None)."""
+    if not _is_local_checkpoint_dir(model_name):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cpu",
+            torch_dtype="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+        )
+        return model, None
+
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    archs = getattr(config, "architectures", None)
+    model_cls = getattr(transformers, archs[0], None) if archs else None
+
+    with init_empty_weights():
+        if model_cls is not None:
+            model = model_cls(config)
+        else:
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    disk_index = SafetensorsIndex(model_name)
+
+    # Local addition: transformers >=5.10 dispatches the fused-experts forward
+    # to torch._grouped_mm when available, whose meta registration hard-requires
+    # BF16 inputs -- but this layerwise replay runs in float32 (RoPE cos/sin
+    # promote hidden states through the chain). Force the eager per-expert
+    # loop, which is dtype-agnostic; observer throughput is dominated by disk
+    # streaming, not the expert matmul dispatch.
+    for cfg_obj in (model.config, getattr(model.config, "get_text_config", lambda: model.config)()):
+        try:
+            cfg_obj._experts_implementation = "eager"
+        except Exception:
+            pass
+
+    text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+    embed_prefix = (
+        "model.language_model.embed_tokens"
+        if hasattr(model.model, "language_model")
+        else "model.embed_tokens"
+    )
+    materialize_module(text_model.embed_tokens, embed_prefix, disk_index, device="cpu")
+
+    # Local addition: multimodal calibration (see vision_calib.py) needs a
+    # real vision tower -- image batches run model.forward(pixel_values=...)
+    # through it before reaching block 0.
+    if getattr(layerwise_args, "vision_dataset", None):
+        from reap.vision_calib import materialize_vision_tower
+
+        materialize_vision_tower(model, disk_index, device="cpu")
+
+    return model, disk_index
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -153,6 +231,7 @@ def record_activations_layerwise(
     obs_args: ObserverArgs,
     layerwise_args: LayerwiseArgs,
     results_dir: pathlib.Path,
+    disk_index: "SafetensorsIndex | None" = None,
 ) -> Dict[int, Dict[str, Any]]:
     """
     Record MoE activations using layerwise processing.
@@ -179,6 +258,7 @@ def record_activations_layerwise(
     observer = LayerwiseMoEObserver(
         model=model,
         hook_config=hook_config,
+        disk_index=disk_index,
     )
 
     # Process all blocks
@@ -277,15 +357,28 @@ def main():
         logger.info("Preparing calibration samples...")
         data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
 
-        # Load model on CPU for layerwise processing
-        logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cpu",
-            torch_dtype="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
-        )
+        # Local addition: append multimodal (image+text) calibration batches so
+        # vision-token expert usage informs saliency -- see vision_calib.py.
+        if getattr(layerwise_args, "vision_dataset", None):
+            from reap.vision_calib import load_vision_batches
+
+            vision_batches = load_vision_batches(
+                model_name,
+                layerwise_args.vision_dataset,
+                layerwise_args.vision_samples,
+                split=layerwise_args.vision_split,
+            )
+            data_batches = data_batches + vision_batches
+            logger.info(
+                f"Appended {len(vision_batches)} vision calibration batches "
+                f"({len(data_batches)} total)"
+            )
+
+        # Load model for layerwise processing (disk-streamed for local checkpoints
+        # too large to fit in RAM; device_map="cpu" full load otherwise -- see
+        # _load_model_for_layerwise_processing)
+        logger.info(f"Loading model {model_name} for layerwise processing...")
+        model, disk_index = _load_model_for_layerwise_processing(model_name, layerwise_args)
         model.eval()
 
         logger.info(f"Model loaded: {model.__class__.__name__}")
@@ -307,6 +400,7 @@ def main():
                 obs_args,
                 layerwise_args,
                 results_dir,
+                disk_index=disk_index,
             )
 
     if reap_args.run_observer_only:
