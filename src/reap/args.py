@@ -533,6 +533,29 @@ class PruneArgs:
 class LayerwiseArgs:
     """Arguments for layerwise (memory-efficient) calibration."""
 
+    # Local addition (see reap/vision_calib.py): multimodal calibration so
+    # vision-token expert usage is visible to REAP saliency. Off by default.
+    vision_dataset: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Image calibration source: a local directory of images, or a "
+                "HuggingFace dataset id with an 'image' column. When set, "
+                "vision_samples image+text batches are appended to the text "
+                "calibration batches and the vision tower is materialized so "
+                "they can run. Default None = text-only (upstream behavior)."
+            )
+        },
+    )
+    vision_samples: int = field(
+        default=64,
+        metadata={"help": "Number of image samples when --vision_dataset is set."},
+    )
+    vision_split: str = field(
+        default="train",
+        metadata={"help": "HF split for --vision_dataset (ignored for local dirs)."},
+    )
+
     batch_group_size: int | None = field(
         default=None,
         metadata={

@@ -121,6 +121,14 @@ def _load_model_for_layerwise_processing(model_name: str, layerwise_args: "Layer
     )
     materialize_module(text_model.embed_tokens, embed_prefix, disk_index, device="cpu")
 
+    # Local addition: multimodal calibration (see vision_calib.py) needs a
+    # real vision tower -- image batches run model.forward(pixel_values=...)
+    # through it before reaching block 0.
+    if getattr(layerwise_args, "vision_dataset", None):
+        from reap.vision_calib import materialize_vision_tower
+
+        materialize_vision_tower(model, disk_index, device="cpu")
+
     return model, disk_index
 
 logger = logging.getLogger(__name__)
@@ -348,6 +356,23 @@ def main():
         # Prepare calibration samples
         logger.info("Preparing calibration samples...")
         data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
+
+        # Local addition: append multimodal (image+text) calibration batches so
+        # vision-token expert usage informs saliency -- see vision_calib.py.
+        if getattr(layerwise_args, "vision_dataset", None):
+            from reap.vision_calib import load_vision_batches
+
+            vision_batches = load_vision_batches(
+                model_name,
+                layerwise_args.vision_dataset,
+                layerwise_args.vision_samples,
+                split=layerwise_args.vision_split,
+            )
+            data_batches = data_batches + vision_batches
+            logger.info(
+                f"Appended {len(vision_batches)} vision calibration batches "
+                f"({len(data_batches)} total)"
+            )
 
         # Load model for layerwise processing (disk-streamed for local checkpoints
         # too large to fit in RAM; device_map="cpu" full load otherwise -- see
