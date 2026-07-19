@@ -219,6 +219,19 @@ class LayerwiseMoEObserver:
         # State dictionary to store metrics per block
         self.state: Dict[int, Dict[str, Any]] = {}
 
+        # Local addition: for models with an MTP (multi-token-prediction) head that
+        # reuses the main model's global expert count, the MTP layer needs its own
+        # saliency pass fed with real final-hidden-state / mask / position inputs.
+        # Rather than re-deriving those (RoPE, causal mask, etc.) by hand, capture
+        # exactly what the *last* main block actually received and produced -- since
+        # MTP's decoder layer has the same layer_type ("full_attention") and config
+        # as the model's own last full_attention block, this is directly reusable.
+        # Populated by _forward_block for block_idx == len(self.blocks) - 1 only;
+        # consumed by reap.mtp_util after record_all_blocks() completes and before
+        # replay_cache.clear() would otherwise discard it.
+        self.final_hidden_states: List[torch.Tensor] = []
+        self.final_block_kwargs: List[Dict[str, Any]] = []
+
         # MoE module cache per block
         self._moe_modules_cache: Dict[int, Optional[nn.Module]] = {}
 
@@ -895,6 +908,19 @@ class LayerwiseMoEObserver:
 
                 if after_forward is not None:
                     after_forward(target_device, attention_mask)
+
+                # Local addition: this is the model's actual last block -- stash its
+                # real inputs/output (moved to CPU) for a possible later MTP saliency
+                # pass. See the final_hidden_states/final_block_kwargs docstring in
+                # __init__ for why this reuse is architecturally valid.
+                if block_idx == len(self.blocks) - 1:
+                    self.final_hidden_states.append(hidden_states.detach().cpu())
+                    self.final_block_kwargs.append(
+                        {
+                            key: move_to_device(value, torch.device("cpu"))
+                            for key, value in block_kwargs.items()
+                        }
+                    )
 
                 block_outputs.append([hidden_states.detach().cpu()])
 

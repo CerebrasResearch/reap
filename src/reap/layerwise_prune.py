@@ -269,6 +269,32 @@ def record_activations_layerwise(
 
     logger.info(f"Layerwise activation recording complete. Saved to {output_file}")
 
+    # Local addition: if this checkpoint has an MTP (multi-token-prediction) head
+    # (mtp.* tensors -- not every checkpoint using this architecture ships them, see
+    # reap/mtp_util.py), also persist what reap.mtp_util needs to run MTP's own
+    # saliency pass later: the real final-hidden-state / mask / position inputs the
+    # model's actual last block received and produced, captured on the observer
+    # during record_all_blocks above (see layerwise_observer.py's
+    # final_hidden_states/final_block_kwargs).
+    if disk_index is not None and any(
+        name.startswith("mtp.") for name in disk_index.weight_map
+    ):
+        mtp_replay_file = output_file.parent / f"mtp_replay_{output_file.name}"
+        torch.save(
+            {
+                "final_hidden_states": observer.final_hidden_states,
+                "final_block_kwargs": observer.final_block_kwargs,
+                # Raw tokenized calibration batches, needed to look up each
+                # position's actual next-token id (the teacher-forcing target MTP's
+                # predictor combines with the final hidden state). Not otherwise
+                # recoverable from the observer -- data_batches never reaches
+                # LayerwiseMoEObserver in tokenized form beyond seeding block 0.
+                "input_ids_batches": data_batches,
+            },
+            mtp_replay_file,
+        )
+        logger.info(f"Saved MTP replay inputs to {mtp_replay_file}")
+
     return observer_data
 
 
