@@ -555,6 +555,19 @@ class LayerwiseArgs:
         default="train",
         metadata={"help": "HF split for --vision_dataset (ignored for local dirs)."},
     )
+    # Local addition (see el_prune_vision_usage_report.py): isolate vision-only
+    # expert usage for the vision/text usage-skew report. Requires --vision_dataset.
+    vision_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Skip text calibration batches entirely -- observer state reflects "
+                "ONLY --vision_dataset samples. Not for normal pruning (you'd lose "
+                "all text saliency signal); used to isolate vision-only expert "
+                "usage stats for comparison against a text-only run."
+            )
+        },
+    )
 
     batch_group_size: int | None = field(
         default=None,

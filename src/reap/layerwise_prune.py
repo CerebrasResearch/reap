@@ -354,8 +354,18 @@ def main():
             )
     else:
         # Prepare calibration samples
-        logger.info("Preparing calibration samples...")
-        data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
+        # Local addition: --vision_only skips text batches entirely, so the
+        # observer state reflects ONLY the vision samples below (see
+        # el_prune_vision_usage_report.py, which diffs this against a normal
+        # text-only run to find which experts are vision-skewed).
+        if layerwise_args.vision_only:
+            if not getattr(layerwise_args, "vision_dataset", None):
+                raise ValueError("--vision_only requires --vision_dataset")
+            logger.info("--vision_only set: skipping text calibration samples")
+            data_batches = []
+        else:
+            logger.info("Preparing calibration samples...")
+            data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
 
         # Local addition: append multimodal (image+text) calibration batches so
         # vision-token expert usage informs saliency -- see vision_calib.py.
