@@ -40,6 +40,40 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+# Local addition: extracted from prune()'s inline body so it's reusable without an
+# already-loaded model -- el_prune_disk_surgery.py calls this directly to compute
+# retained expert indices per layer, then does its own disk-native tensor surgery
+# (no in-memory model instantiation) rather than going through prune()'s
+# in-memory model mutation + save_pretrained path below.
+def select_retained_experts(
+    observer_data, layer, prune_args, n_experts_to_prune, device="cpu"
+) -> list[int]:
+    """Return the sorted list of expert indices to KEEP for one layer, using the
+    same saliency criterion / top-k-least-salient selection as prune()."""
+    num_experts = observer_data[layer]["expert_frequency"].shape[0]
+    if prune_args.prune_method == "ean_ca":
+        ean = torch.zeros(num_experts, device=device, dtype=torch.float32)
+        for i in range(num_experts):
+            ean[i] = torch.linalg.norm(
+                observer_data[layer]["routed_characteristic_activation"][i], dim=-1
+            ).sum()
+        _, experts_to_prune = torch.topk(ean, n_experts_to_prune, largest=False)
+    else:
+        prune_method = prune_args.prune_method
+        if prune_method == "frequency":
+            prune_method = "expert_frequency"
+        saliency_data = observer_data[layer].get(prune_method)
+        if saliency_data is None:
+            raise ValueError(
+                f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
+                f"Available keys: {list(observer_data[layer].keys())}"
+            )
+        _, experts_to_prune = torch.topk(saliency_data, n_experts_to_prune, largest=False)
+
+    experts_to_prune = set(experts_to_prune.tolist())
+    return [i for i in range(num_experts) if i not in experts_to_prune]
+
+
 def prune(
     observer_data,
     model,
@@ -80,31 +114,10 @@ def prune(
                         observer_data[layer][metric][super_experts_in_layer] = float("inf")
 
     for layer in tqdm(observer_data, "Pruning layers..."):
-        num_experts = observer_data[layer]["expert_frequency"].shape[0]
-        if prune_args.prune_method == "ean_ca":
-            ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
-            for i in range(num_experts):
-                ean[i] = torch.linalg.norm(
-                    observer_data[layer]["routed_characteristic_activation"][i], dim=-1
-                ).sum()
-            _, experts_to_prune = torch.topk(ean, n_experts_to_prune, largest=False)
-        else:
-            prune_method = prune_args.prune_method
-            if prune_method == "frequency":
-                prune_method = "expert_frequency"
-            saliency_data = observer_data[layer].get(prune_method)
-            if saliency_data is None:
-                raise ValueError(
-                    f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
-                    f"Available keys: {list(observer_data[layer].keys())}"
-                )
-            _, experts_to_prune = torch.topk(
-                saliency_data, n_experts_to_prune, largest=False
-            )
-
-        retained_expert_indicies = [
-            i for i in range(num_experts) if i not in experts_to_prune
-        ]
+        retained_expert_indicies = select_retained_experts(
+            observer_data, layer, prune_args, n_experts_to_prune,
+            device=model.device,
+        )
         # prune experts
         moe = get_moe(model, layer)
         if not model_attrs["fused"]:
@@ -133,16 +146,26 @@ def prune(
                 )
             setattr(moe, model_attrs["router"], router)
         else:
-            # prune fused experts, only tested for llama-4
+            # prune fused experts. Originally only tested for llama-4 (hardcoded
+            # `moe.router`, assumed nn.Linear with `out_features`); generalized here
+            # to go through model_attrs["router"] and to tolerate routers that are
+            # raw weight Parameters without `out_features` (e.g. Qwen3.5's
+            # Qwen3_5MoeTopKRouter).
             moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
                 retained_expert_indicies
             ]
             moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+            if hasattr(moe.experts, "num_experts"):
+                moe.experts.num_experts = len(retained_expert_indicies)
+            if hasattr(moe, "num_experts"):
+                moe.num_experts = len(retained_expert_indicies)
+            router = getattr(moe, model_attrs["router"])
+            router.weight.data = router.weight.data[retained_expert_indicies]
+            if hasattr(router, "out_features"):
+                router.out_features = len(retained_expert_indicies)
+            if hasattr(router, "num_experts"):  # transformers >= 4.54+
+                router.num_experts = len(retained_expert_indicies)
+            setattr(moe, model_attrs["router"], router)
 
     # patch config and dump
     logger.info("Saving pruned model...")

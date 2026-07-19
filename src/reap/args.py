@@ -533,6 +533,42 @@ class PruneArgs:
 class LayerwiseArgs:
     """Arguments for layerwise (memory-efficient) calibration."""
 
+    # Local addition (see reap/vision_calib.py): multimodal calibration so
+    # vision-token expert usage is visible to REAP saliency. Off by default.
+    vision_dataset: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Image calibration source: a local directory of images, or a "
+                "HuggingFace dataset id with an 'image' column. When set, "
+                "vision_samples image+text batches are appended to the text "
+                "calibration batches and the vision tower is materialized so "
+                "they can run. Default None = text-only (upstream behavior)."
+            )
+        },
+    )
+    vision_samples: int = field(
+        default=64,
+        metadata={"help": "Number of image samples when --vision_dataset is set."},
+    )
+    vision_split: str = field(
+        default="train",
+        metadata={"help": "HF split for --vision_dataset (ignored for local dirs)."},
+    )
+    # Local addition (see el_prune_vision_usage_report.py): isolate vision-only
+    # expert usage for the vision/text usage-skew report. Requires --vision_dataset.
+    vision_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Skip text calibration batches entirely -- observer state reflects "
+                "ONLY --vision_dataset samples. Not for normal pruning (you'd lose "
+                "all text saliency signal); used to isolate vision-only expert "
+                "usage stats for comparison against a text-only run."
+            )
+        },
+    )
+
     batch_group_size: int | None = field(
         default=None,
         metadata={
