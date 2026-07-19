@@ -242,10 +242,18 @@ def load_category_batches(
     # load dataset processor
     proc_cls = DATASET_REGISTRY.get(dataset_name)
     if proc_cls is None:
-        raise ValueError(
-            f"No DatasetProcessor registered for '{dataset_name}'. "
-            f"Supported: {list(DATASET_REGISTRY.keys())}"
-        )
+        # Local addition: local plain-text datasets (a directory with a "text"
+        # column, e.g. one produced by el_export_calibration_corpus.py) don't need a
+        # bespoke DatasetProcessor registered ahead of time -- fall back to a
+        # generic LM-style one instead of raising.
+        if "text" in getattr(raw_ds, "column_names", []):
+            proc_cls = GenericLMDataset
+        else:
+            raise ValueError(
+                f"No DatasetProcessor registered for '{dataset_name}' and it has no "
+                f"'text' column to fall back to a generic LM dataset. "
+                f"Supported named datasets: {list(DATASET_REGISTRY.keys())}"
+            )
 
     # init processor & process dataset
     processor = proc_cls(
@@ -723,6 +731,20 @@ class MagicoderEvolInstructChatDataset(ChatDatasetProcessor):
 
 
 class C4LMDataset(LMDatasetProcessor):
+    category_field: str = None
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        return sample
+
+
+class GenericLMDataset(LMDatasetProcessor):
+    """Local addition: fallback for any plain-text local dataset (a directory
+    containing a .jsonl/.json file with a "text" field per row, e.g. one produced by
+    el_export_calibration_corpus.py) that isn't in DATASET_REGISTRY. Identical to
+    C4LMDataset -- kept as a separate class so registry lookups stay explicit about
+    which datasets are known-good vs. this generic catch-all."""
+
     category_field: str = None
 
     @staticmethod
